@@ -8,7 +8,7 @@
 
 // For _vcprintf
 #include <conio.h>
-#include <stdarg.h>
+#include <cstdarg>
 
 #pragma hdrstop
 
@@ -26,20 +26,14 @@ const COORD VtEngine::INVALID_COORDS = { -1, -1 };
 // Return Value:
 // - An instance of a Renderer.
 VtEngine::VtEngine(_In_ wil::unique_hfile pipe,
-                   const IDefaultColorProvider& colorProvider,
                    const Viewport initialViewport) :
     RenderEngineBase(),
     _hFile(std::move(pipe)),
-    _colorProvider(colorProvider),
-    _LastFG(INVALID_COLOR),
-    _LastBG(INVALID_COLOR),
-    _lastWasBold(false),
+    _lastTextAttributes(INVALID_COLOR, INVALID_COLOR),
     _lastViewport(initialViewport),
-    _invalidRect(Viewport::Empty()),
-    _fInvalidRectUsed(false),
-    _lastRealCursor({ 0 }),
+    _invalidMap(initialViewport.Dimensions()),
     _lastText({ 0 }),
-    _scrollDelta({ 0 }),
+    _scrollDelta({ 0, 0 }),
     _quickReturn(false),
     _clearedAllThisFrame(false),
     _cursorMoved(false),
@@ -55,7 +49,8 @@ VtEngine::VtEngine(_In_ wil::unique_hfile pipe,
     _newBottomLine{ false },
     _deferredCursorPos{ INVALID_COORDS },
     _inResizeRequest{ false },
-    _trace{}
+    _trace{},
+    _bufferLine{}
 {
 #ifndef UNIT_TESTING
     // When unit testing, we can instantiate a VtEngine without a pipe.
@@ -317,39 +312,18 @@ CATCH_RETURN();
         // buffer will have triggered it's own invalidations for what it knows is
         // invalid. Previously, we'd invalidate everything if the width changed,
         // because we couldn't be sure if lines were reflowed.
+        _invalidMap.resize(newView.Dimensions());
     }
     else
     {
         if (SUCCEEDED(hr))
         {
+            _invalidMap.resize(newView.Dimensions(), true); // resize while filling in new space with repaint requests.
+
             // Viewport is smaller now - just update it all.
             if (oldView.Height() > newView.Height() || oldView.Width() > newView.Width())
             {
                 hr = InvalidateAll();
-            }
-            else
-            {
-                // At least one of the directions grew.
-                // First try and add everything to the right of the old viewport,
-                //      then everything below where the old viewport ended.
-                if (oldView.Width() < newView.Width())
-                {
-                    short left = oldView.RightExclusive();
-                    short top = 0;
-                    short right = newView.RightInclusive();
-                    short bottom = oldView.BottomInclusive();
-                    Viewport rightOfOldViewport = Viewport::FromInclusive({ left, top, right, bottom });
-                    hr = _InvalidCombine(rightOfOldViewport);
-                }
-                if (SUCCEEDED(hr) && oldView.Height() < newView.Height())
-                {
-                    short left = 0;
-                    short top = oldView.BottomExclusive();
-                    short right = newView.RightInclusive();
-                    short bottom = newView.BottomInclusive();
-                    Viewport belowOldViewport = Viewport::FromInclusive({ left, top, right, bottom });
-                    hr = _InvalidCombine(belowOldViewport);
-                }
             }
         }
     }
@@ -416,7 +390,7 @@ void VtEngine::SetTestCallback(_In_ std::function<bool(const char* const, size_t
 // - true if the entire viewport has been invalidated
 bool VtEngine::_AllIsInvalid() const
 {
-    return _lastViewport == _invalidRect;
+    return _invalidMap.all();
 }
 
 // Method Description:
@@ -514,4 +488,37 @@ void VtEngine::EndResizeRequest()
 void VtEngine::SetResizeQuirk(const bool resizeQuirk)
 {
     _resizeQuirk = resizeQuirk;
+}
+
+// Method Description:
+// - Manually emit a "Erase Scrollback" sequence to the connected terminal. We
+//   need to do this in certain cases that we've identified where we believe the
+//   client wanted the entire terminal buffer cleared, not just the viewport.
+//   For more information, see GH#3126.
+// - This is unimplemented in the win-telnet, xterm-ascii renderers - inbox
+//   telnet.exe doesn't know how to handle a ^[[3J. This _is_ implemented in the
+//   Xterm256Engine.
+// Arguments:
+// - <none>
+// Return Value:
+// - S_OK if we wrote the sequences successfully, otherwise an appropriate HRESULT
+[[nodiscard]] HRESULT VtEngine::ManuallyClearScrollback() noexcept
+{
+    return S_OK;
+}
+
+// Method Description:
+// - Send a sequence to the connected terminal to request win32-input-mode from
+//   them. This will enable the connected terminal to send us full INPUT_RECORDs
+//   as input. If the terminal doesn't understand this sequence, it'll just
+//   ignore it.
+// Arguments:
+// - <none>
+// Return Value:
+// - S_OK if we succeeded, else an appropriate HRESULT for failing to allocate or write.
+HRESULT VtEngine::RequestWin32Input() noexcept
+{
+    RETURN_IF_FAILED(_RequestWin32Input());
+    RETURN_IF_FAILED(_Flush());
+    return S_OK;
 }

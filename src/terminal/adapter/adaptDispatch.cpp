@@ -8,6 +8,7 @@
 #include "../../types/inc/Viewport.hpp"
 #include "../../types/inc/utils.hpp"
 #include "../../inc/unicode.hpp"
+#include "../parser/ascii.hpp"
 
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::VirtualTerminal;
@@ -31,9 +32,6 @@ AdaptDispatch::AdaptDispatch(std::unique_ptr<ConGetSet> pConApi,
     _usingAltBuffer(false),
     _isOriginModeRelative(false), // by default, the DECOM origin mode is absolute.
     _isDECCOLMAllowed(false), // by default, DECCOLM is not allowed.
-    _changedBackground(false),
-    _changedForeground(false),
-    _changedMetaAttrs(false),
     _termOutput()
 {
     THROW_HR_IF_NULL(E_INVALIDARG, _pConApi.get());
@@ -49,7 +47,15 @@ AdaptDispatch::AdaptDispatch(std::unique_ptr<ConGetSet> pConApi,
 // - <none>
 void AdaptDispatch::Print(const wchar_t wchPrintable)
 {
-    _pDefaults->Print(_termOutput.TranslateKey(wchPrintable));
+    const auto wchTranslated = _termOutput.TranslateKey(wchPrintable);
+    // By default the DEL character is meant to be ignored in the same way as a
+    // NUL character. However, it's possible that it could be translated to a
+    // printable character in a 96-character set. This condition makes sure that
+    // a character is only output if the DEL is translated to something else.
+    if (wchTranslated != AsciiChars::DEL)
+    {
+        _pDefaults->Print(wchTranslated);
+    }
 }
 
 // Routine Description
@@ -338,6 +344,7 @@ bool AdaptDispatch::CursorSaveState()
         savedCursorState.IsOriginModeRelative = _isOriginModeRelative;
         savedCursorState.Attributes = attributes;
         savedCursorState.TermOutput = _termOutput;
+        _pConApi->GetConsoleOutputCP(savedCursorState.CodePage);
     }
 
     return success;
@@ -378,6 +385,12 @@ bool AdaptDispatch::CursorRestoreState()
 
     // Restore designated character set.
     _termOutput = savedCursorState.TermOutput;
+
+    // Restore the code page if it was previously saved.
+    if (savedCursorState.CodePage != 0)
+    {
+        success = _pConApi->SetConsoleOutputCP(savedCursorState.CodePage);
+    }
 
     return success;
 }
@@ -571,6 +584,8 @@ bool AdaptDispatch::EraseCharacters(const size_t numChars)
 // - True if handled successfully. False otherwise.
 bool AdaptDispatch::EraseInDisplay(const DispatchTypes::EraseType eraseType)
 {
+    RETURN_BOOL_IF_FALSE(eraseType <= DispatchTypes::EraseType::Scrollback);
+
     // First things first. If this is a "Scrollback" clear, then just do that.
     // Scrollback clears erase everything in the "scrollback" of a *nix terminal
     //      Everything that's scrolled off the screen so far.
@@ -580,7 +595,7 @@ bool AdaptDispatch::EraseInDisplay(const DispatchTypes::EraseType eraseType)
     {
         const bool eraseScrollbackResult = _EraseScrollback();
         // GH#2715 - If this succeeded, but we're in a conpty, return `false` to
-        // make the state machine propogate this ED sequence to the connected
+        // make the state machine propagate this ED sequence to the connected
         // terminal application. While we're in conpty mode, we don't really
         // have a scrollback, but the attached terminal might.
         const bool isPty = _pConApi->IsConsolePty();
@@ -588,7 +603,15 @@ bool AdaptDispatch::EraseInDisplay(const DispatchTypes::EraseType eraseType)
     }
     else if (eraseType == DispatchTypes::EraseType::All)
     {
-        return _EraseAll();
+        // GH#5683 - If this succeeded, but we're in a conpty, return `false` to
+        // make the state machine propagate this ED sequence to the connected
+        // terminal application. While we're in conpty mode, when the client
+        // requests a Erase All operation, we need to manually tell the
+        // connected terminal to do the same thing, so that the terminal will
+        // move it's own buffer contents into the scrollback.
+        const bool eraseAllResult = _EraseAll();
+        const bool isPty = _pConApi->IsConsolePty();
+        return eraseAllResult && (!isPty);
     }
 
     CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
@@ -660,6 +683,8 @@ bool AdaptDispatch::EraseInDisplay(const DispatchTypes::EraseType eraseType)
 // - True if handled successfully. False otherwise.
 bool AdaptDispatch::EraseInLine(const DispatchTypes::EraseType eraseType)
 {
+    RETURN_BOOL_IF_FALSE(eraseType <= DispatchTypes::EraseType::All);
+
     CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
     csbiex.cbSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
     bool success = _pConApi->GetConsoleScreenBufferInfoEx(csbiex);
@@ -685,6 +710,9 @@ bool AdaptDispatch::DeviceStatusReport(const DispatchTypes::AnsiStatusType statu
 
     switch (statusType)
     {
+    case DispatchTypes::AnsiStatusType::OS_OperatingStatus:
+        success = _OperatingStatus();
+        break;
     case DispatchTypes::AnsiStatusType::CPR_CursorPositionReport:
         success = _CursorPositionReport();
         break;
@@ -704,6 +732,91 @@ bool AdaptDispatch::DeviceAttributes()
 {
     // See: http://vt100.net/docs/vt100-ug/chapter3.html#DA
     return _WriteResponse(L"\x1b[?1;0c");
+}
+
+// Routine Description:
+// - DA2 - Reports the terminal type, firmware version, and hardware options.
+//   For now we're following the XTerm practice of using 0 to represent a VT100
+//   terminal, the version is hardcoded as 10 (1.0), and the hardware option
+//   is set to 1 (indicating a PC Keyboard).
+// Arguments:
+// - <none>
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::SecondaryDeviceAttributes()
+{
+    return _WriteResponse(L"\x1b[>0;10;1c");
+}
+
+// Routine Description:
+// - DA3 - Reports the terminal unit identification code. Terminal emulators
+//   typically return a hardcoded value, the most common being all zeros.
+// Arguments:
+// - <none>
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::TertiaryDeviceAttributes()
+{
+    return _WriteResponse(L"\x1bP!|00000000\x1b\\");
+}
+
+// Routine Description:
+// - VT52 Identify - Reports the identity of the terminal in VT52 emulation mode.
+//   An actual VT52 terminal would typically identify itself with ESC / K.
+//   But for a terminal that is emulating a VT52, the sequence should be ESC / Z.
+// Arguments:
+// - <none>
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::Vt52DeviceAttributes()
+{
+    return _WriteResponse(L"\x1b/Z");
+}
+
+// Routine Description:
+// - DECREQTPARM - This sequence was originally used on the VT100 terminal to
+//   report the serial communication parameters (baud rate, data bits, parity,
+//   etc.). On modern terminal emulators, the response is simply hardcoded.
+// Arguments:
+// - permission - This would originally have determined whether the terminal
+//   was allowed to send unsolicited reports or not.
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::RequestTerminalParameters(const DispatchTypes::ReportingPermission permission)
+{
+    // We don't care whether unsolicited reports are allowed or not, but the
+    // requested permission does determine the value of the first response
+    // parameter. The remaining parameters are just hardcoded to indicate a
+    // 38400 baud connection, which matches the XTerm response. The full
+    // parameter sequence is as follows:
+    // - response type:    2 or 3 (unsolicited or solicited)
+    // - parity:           1 (no parity)
+    // - data bits:        1 (8 bits per character)
+    // - transmit speed:   128 (38400 baud)
+    // - receive speed:    128 (38400 baud)
+    // - clock multiplier: 1
+    // - flags:            0
+    switch (permission)
+    {
+    case DispatchTypes::ReportingPermission::Unsolicited:
+        return _WriteResponse(L"\x1b[2;1;1;128;128;1;0x");
+    case DispatchTypes::ReportingPermission::Solicited:
+        return _WriteResponse(L"\x1b[3;1;1;128;128;1;0x");
+    default:
+        return false;
+    }
+}
+
+// Routine Description:
+// - DSR-OS - Reports the operating status back to the input channel
+// Arguments:
+// - <none>
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::_OperatingStatus() const
+{
+    // We always report a good operating condition.
+    return _WriteResponse(L"\x1b[0n");
 }
 
 // Routine Description:
@@ -780,7 +893,11 @@ bool AdaptDispatch::_WriteResponse(const std::wstring_view reply) const
     }
 
     size_t eventsWritten;
-    success = _pConApi->PrivatePrependConsoleInput(inEvents, eventsWritten);
+    // TODO GH#4954 During the input refactor we may want to add a "priority" input list
+    // to make sure that "response" input is spooled directly into the application.
+    // We switched this to an append (vs. a prepend) to fix GH#1637, a bug where two CPR
+    // could collide with eachother.
+    success = _pConApi->PrivateWriteConsoleInputW(inEvents, eventsWritten);
 
     return success;
 }
@@ -923,7 +1040,7 @@ bool AdaptDispatch::_DoDECCOLMHelper(const size_t columns)
 // Routine Description:
 // - Support routine for routing private mode parameters to be set/reset as flags
 // Arguments:
-// - params - array of params to set/reset
+// - param - mode parameter to set/reset
 // - enable - True for set, false for unset.
 // Return Value:
 // - True if handled successfully. False otherwise.
@@ -935,6 +1052,9 @@ bool AdaptDispatch::_PrivateModeParamsHelper(const DispatchTypes::PrivateModePar
     case DispatchTypes::PrivateModeParams::DECCKM_CursorKeysMode:
         // set - Enable Application Mode, reset - Normal mode
         success = SetCursorKeysMode(enable);
+        break;
+    case DispatchTypes::PrivateModeParams::DECANM_AnsiMode:
+        success = SetAnsiMode(enable);
         break;
     case DispatchTypes::PrivateModeParams::DECCOLM_SetNumberOfColumns:
         success = _DoDECCOLMHelper(enable ? DispatchTypes::s_sDECCOLMSetColumns : DispatchTypes::s_sDECCOLMResetColumns);
@@ -979,6 +1099,9 @@ bool AdaptDispatch::_PrivateModeParamsHelper(const DispatchTypes::PrivateModePar
     case DispatchTypes::PrivateModeParams::ASB_AlternateScreenBuffer:
         success = enable ? UseAlternateScreenBuffer() : UseMainScreenBuffer();
         break;
+    case DispatchTypes::PrivateModeParams::W32IM_Win32InputMode:
+        success = EnableWin32InputMode(enable);
+        break;
     default:
         // If no functions to call, overall dispatch was a failure.
         success = false;
@@ -988,47 +1111,25 @@ bool AdaptDispatch::_PrivateModeParamsHelper(const DispatchTypes::PrivateModePar
 }
 
 // Routine Description:
-// - Generalized handler for the setting/resetting of DECSET/DECRST parameters.
-//     All params in the rgParams will attempt to be executed, even if one
-//     fails, to allow us to successfully re/set params that are chained with
-//     params we don't yet support.
-// Arguments:
-// - params - array of params to set/reset
-// - enable - True for set, false for unset.
-// Return Value:
-// - True if ALL params were handled successfully. False otherwise.
-bool AdaptDispatch::_SetResetPrivateModes(const std::basic_string_view<DispatchTypes::PrivateModeParams> params, const bool enable)
-{
-    // because the user might chain together params we don't support with params we DO support, execute all
-    // params in the sequence, and only return failure if we failed at least one of them
-    size_t failures = 0;
-    for (const auto& p : params)
-    {
-        failures += _PrivateModeParamsHelper(p, enable) ? 0 : 1; // increment the number of failures if we fail.
-    }
-    return failures == 0;
-}
-
-// Routine Description:
 // - DECSET - Enables the given DEC private mode params.
 // Arguments:
-// - params - array of params to set
+// - param - mode parameter to set
 // Return Value:
 // - True if handled successfully. False otherwise.
-bool AdaptDispatch::SetPrivateModes(const std::basic_string_view<DispatchTypes::PrivateModeParams> params)
+bool AdaptDispatch::SetPrivateMode(const DispatchTypes::PrivateModeParams param)
 {
-    return _SetResetPrivateModes(params, true);
+    return _PrivateModeParamsHelper(param, true);
 }
 
 // Routine Description:
 // - DECRST - Disables the given DEC private mode params.
 // Arguments:
-// - params - array of params to reset
+// - param - mode parameter to reset
 // Return Value:
 // - True if handled successfully. False otherwise.
-bool AdaptDispatch::ResetPrivateModes(const std::basic_string_view<DispatchTypes::PrivateModeParams> params)
+bool AdaptDispatch::ResetPrivateMode(const DispatchTypes::PrivateModeParams param)
 {
-    return _SetResetPrivateModes(params, false);
+    return _PrivateModeParamsHelper(param, false);
 }
 
 // - DECKPAM, DECKPNM - Sets the keypad input mode to either Application mode or Numeric mode (true, false respectively)
@@ -1041,11 +1142,27 @@ bool AdaptDispatch::SetKeypadMode(const bool fApplicationMode)
     bool success = true;
     success = _pConApi->PrivateSetKeypadMode(fApplicationMode);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
+    {
+        return false;
+    }
+
+    return success;
+}
+
+// Method Description:
+// - win32-input-mode: Enable sending full input records encoded as a string of
+//   characters to the client application.
+// Arguments:
+// - win32InputMode - set to true to enable win32-input-mode, false to disable.
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::EnableWin32InputMode(const bool win32InputMode)
+{
+    bool success = true;
+    success = _pConApi->PrivateEnableWin32InputMode(win32InputMode);
+
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1063,11 +1180,7 @@ bool AdaptDispatch::SetCursorKeysMode(const bool applicationMode)
     bool success = true;
     success = _pConApi->PrivateSetCursorKeysMode(applicationMode);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1115,6 +1228,20 @@ bool AdaptDispatch::DeleteLine(const size_t distance)
     return _pConApi->DeleteLines(distance);
 }
 
+// - DECANM - Sets the terminal emulation mode to either ANSI-compatible or VT52.
+// Arguments:
+// - ansiMode - set to true to enable the ANSI mode, false for VT52 mode.
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::SetAnsiMode(const bool ansiMode)
+{
+    // When an attempt is made to update the mode, the designated character sets
+    // need to be reset to defaults, even if the mode doesn't actually change.
+    _termOutput = {};
+
+    return _pConApi->PrivateSetAnsiMode(ansiMode);
+}
+
 // Routine Description:
 // - DECSCNM - Sets the screen mode to either normal or reverse.
 //    When in reverse screen mode, the background and foreground colors are switched.
@@ -1124,6 +1251,12 @@ bool AdaptDispatch::DeleteLine(const size_t distance)
 // - True if handled successfully. False otherwise.
 bool AdaptDispatch::SetScreenMode(const bool reverseMode)
 {
+    // If we're a conpty, always return false
+    if (_pConApi->IsConsolePty())
+    {
+        return false;
+    }
+
     return _pConApi->PrivateSetScreenMode(reverseMode);
 }
 
@@ -1362,7 +1495,18 @@ bool AdaptDispatch::UseMainScreenBuffer()
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::HorizontalTabSet()
 {
-    return _pConApi->PrivateHorizontalTabSet();
+    CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
+    csbiex.cbSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
+    const bool success = _pConApi->GetConsoleScreenBufferInfoEx(csbiex);
+    if (success)
+    {
+        const auto width = csbiex.dwSize.X;
+        const auto column = csbiex.dwCursorPosition.X;
+
+        _InitTabStopsForWidth(width);
+        _tabStopColumns.at(column) = true;
+    }
+    return success;
 }
 
 //Routine Description:
@@ -1376,7 +1520,29 @@ bool AdaptDispatch::HorizontalTabSet()
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::ForwardTab(const size_t numTabs)
 {
-    return _pConApi->PrivateForwardTab(numTabs);
+    CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
+    csbiex.cbSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
+    bool success = _pConApi->GetConsoleScreenBufferInfoEx(csbiex);
+    if (success)
+    {
+        const auto width = csbiex.dwSize.X;
+        const auto row = csbiex.dwCursorPosition.Y;
+        auto column = csbiex.dwCursorPosition.X;
+        auto tabsPerformed = 0u;
+
+        _InitTabStopsForWidth(width);
+        while (column + 1 < width && tabsPerformed < numTabs)
+        {
+            column++;
+            if (til::at(_tabStopColumns, column))
+            {
+                tabsPerformed++;
+            }
+        }
+
+        success = _pConApi->SetConsoleCursorPosition({ column, row });
+    }
+    return success;
 }
 
 //Routine Description:
@@ -1388,7 +1554,29 @@ bool AdaptDispatch::ForwardTab(const size_t numTabs)
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::BackwardsTab(const size_t numTabs)
 {
-    return _pConApi->PrivateBackwardsTab(numTabs);
+    CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
+    csbiex.cbSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
+    bool success = _pConApi->GetConsoleScreenBufferInfoEx(csbiex);
+    if (success)
+    {
+        const auto width = csbiex.dwSize.X;
+        const auto row = csbiex.dwCursorPosition.Y;
+        auto column = csbiex.dwCursorPosition.X;
+        auto tabsPerformed = 0u;
+
+        _InitTabStopsForWidth(width);
+        while (column > 0 && tabsPerformed < numTabs)
+        {
+            column--;
+            if (til::at(_tabStopColumns, column))
+            {
+                tabsPerformed++;
+            }
+        }
+
+        success = _pConApi->SetConsoleCursorPosition({ column, row });
+    }
+    return success;
 }
 
 //Routine Description:
@@ -1399,34 +1587,205 @@ bool AdaptDispatch::BackwardsTab(const size_t numTabs)
 // - clearType - Whether to clear the current column, or all columns, defined in DispatchTypes::TabClearType
 // Return value:
 // True if handled successfully. False otherwise.
-bool AdaptDispatch::TabClear(const size_t clearType)
+bool AdaptDispatch::TabClear(const DispatchTypes::TabClearType clearType)
 {
     bool success = false;
     switch (clearType)
     {
     case DispatchTypes::TabClearType::ClearCurrentColumn:
-        success = _pConApi->PrivateTabClear(false);
+        success = _ClearSingleTabStop();
         break;
     case DispatchTypes::TabClearType::ClearAllColumns:
-        success = _pConApi->PrivateTabClear(true);
+        success = _ClearAllTabStops();
+        break;
+    default:
+        success = false;
+        break;
+    }
+    return success;
+}
+
+// Routine Description:
+// - Clears the tab stop in the cursor's current column, if there is one.
+// Arguments:
+// - <none>
+// Return value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::_ClearSingleTabStop()
+{
+    CONSOLE_SCREEN_BUFFER_INFOEX csbiex = { 0 };
+    csbiex.cbSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
+    const bool success = _pConApi->GetConsoleScreenBufferInfoEx(csbiex);
+    if (success)
+    {
+        const auto width = csbiex.dwSize.X;
+        const auto column = csbiex.dwCursorPosition.X;
+
+        _InitTabStopsForWidth(width);
+        _tabStopColumns.at(column) = false;
+    }
+    return success;
+}
+
+// Routine Description:
+// - Clears all tab stops and resets the _initDefaultTabStops flag to indicate
+//    that they shouldn't be reinitialized at the default positions.
+// Arguments:
+// - <none>
+// Return value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::_ClearAllTabStops() noexcept
+{
+    _tabStopColumns.clear();
+    _initDefaultTabStops = false;
+    return true;
+}
+
+// Routine Description:
+// - Clears all tab stops and sets the _initDefaultTabStops flag to indicate
+//    that the default positions should be reinitialized when needed.
+// Arguments:
+// - <none>
+// Return value:
+// - <none>
+void AdaptDispatch::_ResetTabStops() noexcept
+{
+    _tabStopColumns.clear();
+    _initDefaultTabStops = true;
+}
+
+// Routine Description:
+// - Resizes the _tabStopColumns table so it's large enough to support the
+//    current screen width, initializing tab stops every 8 columns in the
+//    newly allocated space, iff the _initDefaultTabStops flag is set.
+// Arguments:
+// - width - the width of the screen buffer that we need to accomodate
+// Return value:
+// - <none>
+void AdaptDispatch::_InitTabStopsForWidth(const size_t width)
+{
+    const auto initialWidth = _tabStopColumns.size();
+    if (width > initialWidth)
+    {
+        _tabStopColumns.resize(width);
+        if (_initDefaultTabStops)
+        {
+            for (auto column = 8u; column < _tabStopColumns.size(); column += 8)
+            {
+                if (column >= initialWidth)
+                {
+                    til::at(_tabStopColumns, column) = true;
+                }
+            }
+        }
+    }
+}
+
+//Routine Description:
+// DOCS - Selects the coding system through which character sets are activated.
+//     When ISO2022 is selected, the code page is set to ISO-8859-1, and both
+//     GL and GR areas of the code table can be remapped. When UTF8 is selected,
+//     the code page is set to UTF-8, and only the GL area can be remapped.
+//Arguments:
+// - codingSystem - The coding system that will be selected.
+// Return value:
+// True if handled successfully. False otherwise.
+bool AdaptDispatch::DesignateCodingSystem(const VTID codingSystem)
+{
+    // If we haven't previously saved the initial code page, do so now.
+    // This will be used to restore the code page in response to a reset.
+    if (!_initialCodePage.has_value())
+    {
+        unsigned int currentCodePage;
+        _pConApi->GetConsoleOutputCP(currentCodePage);
+        _initialCodePage = currentCodePage;
+    }
+
+    bool success = false;
+    switch (codingSystem)
+    {
+    case DispatchTypes::CodingSystem::ISO2022:
+        success = _pConApi->SetConsoleOutputCP(28591);
+        if (success)
+        {
+            _termOutput.EnableGrTranslation(true);
+        }
+        break;
+    case DispatchTypes::CodingSystem::UTF8:
+        success = _pConApi->SetConsoleOutputCP(CP_UTF8);
+        if (success)
+        {
+            _termOutput.EnableGrTranslation(false);
+        }
+        break;
+    default:
+        success = false;
         break;
     }
     return success;
 }
 
 //Routine Description:
-// Designate Charset - Sets the active charset to be the one mapped to wch.
-//     See DispatchTypes::VTCharacterSets for a list of supported charsets.
-//     Also http://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Controls-beginning-with-ESC
-//       For a list of all charsets and their codes.
+// Designate Charset - Selects a specific 94-character set into one of the four G-sets.
+//     See http://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Controls-beginning-with-ESC
+//       for a list of all charsets and their codes.
 //     If the specified charset is unsupported, we do nothing (remain on the current one)
 //Arguments:
-// - wchCharset - The character indicating the charset we should switch to.
+// - gsetNumber - The G-set into which the charset will be selected.
+// - charset - The identifier indicating the charset that will be used.
 // Return value:
 // True if handled successfully. False otherwise.
-bool AdaptDispatch::DesignateCharset(const wchar_t wchCharset) noexcept
+bool AdaptDispatch::Designate94Charset(const size_t gsetNumber, const VTID charset)
 {
-    return _termOutput.DesignateCharset(wchCharset);
+    return _termOutput.Designate94Charset(gsetNumber, charset);
+}
+
+//Routine Description:
+// Designate Charset - Selects a specific 96-character set into one of the four G-sets.
+//     See http://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Controls-beginning-with-ESC
+//       for a list of all charsets and their codes.
+//     If the specified charset is unsupported, we do nothing (remain on the current one)
+//Arguments:
+// - gsetNumber - The G-set into which the charset will be selected.
+// - charset - The identifier indicating the charset that will be used.
+// Return value:
+// True if handled successfully. False otherwise.
+bool AdaptDispatch::Designate96Charset(const size_t gsetNumber, const VTID charset)
+{
+    return _termOutput.Designate96Charset(gsetNumber, charset);
+}
+
+//Routine Description:
+// Locking Shift - Invoke one of the G-sets into the left half of the code table.
+//Arguments:
+// - gsetNumber - The G-set that will be invoked.
+// Return value:
+// True if handled successfully. False otherwise.
+bool AdaptDispatch::LockingShift(const size_t gsetNumber)
+{
+    return _termOutput.LockingShift(gsetNumber);
+}
+
+//Routine Description:
+// Locking Shift Right - Invoke one of the G-sets into the right half of the code table.
+//Arguments:
+// - gsetNumber - The G-set that will be invoked.
+// Return value:
+// True if handled successfully. False otherwise.
+bool AdaptDispatch::LockingShiftRight(const size_t gsetNumber)
+{
+    return _termOutput.LockingShiftRight(gsetNumber);
+}
+
+//Routine Description:
+// Single Shift - Temporarily invoke one of the G-sets into the code table.
+//Arguments:
+// - gsetNumber - The G-set that will be invoked.
+// Return value:
+// True if handled successfully. False otherwise.
+bool AdaptDispatch::SingleShift(const size_t gsetNumber)
+{
+    return _termOutput.SingleShift(gsetNumber);
 }
 
 //Routine Description:
@@ -1463,44 +1822,28 @@ bool AdaptDispatch::DesignateCharset(const wchar_t wchCharset) noexcept
 bool AdaptDispatch::SoftReset()
 {
     bool success = CursorVisibility(true); // Cursor enabled.
-    if (success)
+    success = SetOriginMode(false) && success; // Absolute cursor addressing.
+    success = SetAutoWrapMode(true) && success; // Wrap at end of line.
+    success = SetCursorKeysMode(false) && success; // Normal characters.
+    success = SetKeypadMode(false) && success; // Numeric characters.
+
+    // Top margin = 1; bottom margin = page length.
+    success = _DoSetTopBottomScrollingMargins(0, 0) && success;
+
+    _termOutput = {}; // Reset all character set designations.
+    if (_initialCodePage.has_value())
     {
-        success = SetOriginMode(false); // Absolute cursor addressing.
+        // Restore initial code page if previously changed by a DOCS sequence.
+        success = _pConApi->SetConsoleOutputCP(_initialCodePage.value()) && success;
     }
-    if (success)
-    {
-        success = SetAutoWrapMode(true); // Wrap at end of line.
-    }
-    if (success)
-    {
-        success = SetCursorKeysMode(false); // Normal characters.
-    }
-    if (success)
-    {
-        success = SetKeypadMode(false); // Numeric characters.
-    }
-    if (success)
-    {
-        // Top margin = 1; bottom margin = page length.
-        success = _DoSetTopBottomScrollingMargins(0, 0);
-    }
-    if (success)
-    {
-        success = DesignateCharset(DispatchTypes::VTCharacterSets::USASCII); // Default Charset
-    }
-    if (success)
-    {
-        const auto opt = DispatchTypes::GraphicsOptions::Off;
-        success = SetGraphicsRendition({ &opt, 1 }); // Normal rendition.
-    }
-    if (success)
-    {
-        // Reset the saved cursor state.
-        // Note that XTerm only resets the main buffer state, but that
-        // seems likely to be a bug. Most other terminals reset both.
-        _savedCursorState.at(0) = {}; // Main buffer
-        _savedCursorState.at(1) = {}; // Alt buffer
-    }
+
+    success = SetGraphicsRendition({}) && success; // Normal rendition.
+
+    // Reset the saved cursor state.
+    // Note that XTerm only resets the main buffer state, but that
+    // seems likely to be a bug. Most other terminals reset both.
+    _savedCursorState.at(0) = {}; // Main buffer
+    _savedCursorState.at(1) = {}; // Alt buffer
 
     return success;
 }
@@ -1508,6 +1851,8 @@ bool AdaptDispatch::SoftReset()
 //Routine Description:
 // Full Reset - Perform a hard reset of the terminal. http://vt100.net/docs/vt220-rm/chapter4.html
 //  RIS performs the following actions: (Items with sub-bullets are supported)
+//   - Switches to the main screen buffer if in the alt buffer.
+//      * This matches the XTerm behaviour, which is the de facto standard for the alt buffer.
 //   - Performs a communications line disconnect.
 //   - Clears UDKs.
 //   - Clears a down-line-loaded character set.
@@ -1526,37 +1871,34 @@ bool AdaptDispatch::SoftReset()
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::HardReset()
 {
+    bool success = true;
+
+    // If in the alt buffer, switch back to main before doing anything else.
+    if (_usingAltBuffer)
+    {
+        success = _pConApi->PrivateUseMainScreenBuffer();
+        _usingAltBuffer = !success;
+    }
+
     // Sets the SGR state to normal - this must be done before EraseInDisplay
     //      to ensure that it clears with the default background color.
-    bool success = SoftReset();
+    success = SoftReset() && success;
 
     // Clears the screen - Needs to be done in two operations.
-    if (success)
-    {
-        success = EraseInDisplay(DispatchTypes::EraseType::All);
-    }
-    if (success)
-    {
-        success = _EraseScrollback();
-    }
+    success = EraseInDisplay(DispatchTypes::EraseType::All) && success;
+    success = EraseInDisplay(DispatchTypes::EraseType::Scrollback) && success;
 
     // Set the DECSCNM screen mode back to normal.
-    if (success)
-    {
-        success = SetScreenMode(false);
-    }
+    success = SetScreenMode(false) && success;
 
     // Cursor to 1,1 - the Soft Reset guarantees this is absolute
-    if (success)
-    {
-        success = CursorPosition(1, 1);
-    }
+    success = CursorPosition(1, 1) && success;
 
-    // delete all current tab stops and reapply
-    _pConApi->PrivateSetDefaultTabStops();
+    // Delete all current tab stops and reapply
+    _ResetTabStops();
 
     // GH#2715 - If all this succeeded, but we're in a conpty, return `false` to
-    // make the state machine propogate this RIS sequence to the connected
+    // make the state machine propagate this RIS sequence to the connected
     // terminal application. We've reset our state, but the connected terminal
     // might need to do more.
     if (_pConApi->IsConsolePty())
@@ -1590,8 +1932,12 @@ bool AdaptDispatch::ScreenAlignmentPattern()
         const auto fillLength = (csbiex.srWindow.Bottom - csbiex.srWindow.Top) * csbiex.dwSize.X;
         success = _pConApi->PrivateFillRegion(fillPosition, fillLength, L'E', false);
         // Reset the meta/extended attributes (but leave the colors unchanged).
-        success = success && _pConApi->PrivateSetLegacyAttributes(0, false, false, true);
-        success = success && _pConApi->PrivateSetExtendedTextAttributes(ExtendedAttributes::Normal);
+        TextAttribute attr;
+        if (_pConApi->PrivateGetTextAttributes(attr))
+        {
+            attr.SetStandardErase();
+            success = success && _pConApi->PrivateSetTextAttributes(attr);
+        }
         // Reset the origin mode to absolute.
         success = success && SetOriginMode(false);
         // Clear the scrolling margins.
@@ -1712,11 +2058,7 @@ bool AdaptDispatch::EnableVT200MouseMode(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableVT200MouseMode(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1736,11 +2078,7 @@ bool AdaptDispatch::EnableUTF8ExtendedMouseMode(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableUTF8ExtendedMouseMode(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1760,11 +2098,7 @@ bool AdaptDispatch::EnableSGRExtendedMouseMode(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableSGRExtendedMouseMode(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1783,11 +2117,7 @@ bool AdaptDispatch::EnableButtonEventMouseMode(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableButtonEventMouseMode(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1807,11 +2137,7 @@ bool AdaptDispatch::EnableAnyEventMouseMode(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableAnyEventMouseMode(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1831,11 +2157,7 @@ bool AdaptDispatch::EnableAlternateScroll(const bool enabled)
     bool success = true;
     success = _pConApi->PrivateEnableAlternateScroll(enabled);
 
-    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always return false
-    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
-    // output, but not Input. Once the conpty supports these types of input,
-    // this check can be removed. See GH#4911
-    if (_pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled())
+    if (_ShouldPassThroughInputModeChange())
     {
         return false;
     }
@@ -1857,8 +2179,11 @@ bool AdaptDispatch::SetCursorStyle(const DispatchTypes::CursorStyle cursorStyle)
 
     switch (cursorStyle)
     {
+    case DispatchTypes::CursorStyle::UserDefault:
+        _pConApi->GetUserDefaultCursorStyle(actualType);
+        fEnableBlinking = true;
+        break;
     case DispatchTypes::CursorStyle::BlinkingBlock:
-    case DispatchTypes::CursorStyle::BlinkingBlockDefault:
         fEnableBlinking = true;
         actualType = CursorType::FullBox;
         break;
@@ -1884,6 +2209,10 @@ bool AdaptDispatch::SetCursorStyle(const DispatchTypes::CursorStyle cursorStyle)
         fEnableBlinking = false;
         actualType = CursorType::VerticalBar;
         break;
+
+    default:
+        // Invalid argument should be handled by the connected terminal.
+        return false;
     }
 
     bool success = _pConApi->SetCursorStyle(actualType);
@@ -1919,6 +2248,17 @@ bool AdaptDispatch::SetCursorColor(const COLORREF cursorColor)
     return _pConApi->SetCursorColor(cursorColor);
 }
 
+// Routine Description:
+// - OSC Copy to Clipboard
+// Arguments:
+// - content - The content to copy to clipboard. Must be null terminated.
+// Return Value:
+// - True if handled successfully. False otherwise.
+bool AdaptDispatch::SetClipboard(const std::wstring_view /*content*/) noexcept
+{
+    return false;
+}
+
 // Method Description:
 // - Sets a single entry of the colortable to a new value
 // Arguments:
@@ -1928,12 +2268,7 @@ bool AdaptDispatch::SetCursorColor(const COLORREF cursorColor)
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::SetColorTableEntry(const size_t tableIndex, const DWORD dwColor)
 {
-    bool success = tableIndex < 256;
-    if (success)
-    {
-        const auto realIndex = ::Xterm256ToWindowsIndex(tableIndex);
-        success = _pConApi->PrivateSetColorTableEntry(realIndex, dwColor);
-    }
+    const bool success = _pConApi->PrivateSetColorTableEntry(tableIndex, dwColor);
 
     // If we're a conpty, always return false, so that we send the updated color
     //      value to the terminal. Still handle the sequence so apps that use
@@ -2001,11 +2336,13 @@ bool Microsoft::Console::VirtualTerminal::AdaptDispatch::SetDefaultBackground(co
 //      codes that are supported in one direction but not the other.
 //Arguments:
 // - function - An identifier of the WindowManipulation function to perform
-// - parameters - Additional parameters to pass to the function
+// - parameter1 - The first optional parameter for the function
+// - parameter2 - The second optional parameter for the function
 // Return value:
 // True if handled successfully. False otherwise.
 bool AdaptDispatch::WindowManipulation(const DispatchTypes::WindowManipulationType function,
-                                       const std::basic_string_view<size_t> parameters)
+                                       const VTParameter parameter1,
+                                       const VTParameter parameter2)
 {
     bool success = false;
     // Other Window Manipulation functions:
@@ -2014,20 +2351,53 @@ bool AdaptDispatch::WindowManipulation(const DispatchTypes::WindowManipulationTy
     switch (function)
     {
     case DispatchTypes::WindowManipulationType::RefreshWindow:
-        if (parameters.empty())
-        {
-            success = DispatchCommon::s_RefreshWindow(*_pConApi);
-        }
+        success = DispatchCommon::s_RefreshWindow(*_pConApi);
         break;
     case DispatchTypes::WindowManipulationType::ResizeWindowInCharacters:
-        if (parameters.size() == 2)
-        {
-            success = DispatchCommon::s_ResizeWindow(*_pConApi, til::at(parameters, 1), til::at(parameters, 0));
-        }
+        success = DispatchCommon::s_ResizeWindow(*_pConApi, parameter2.value_or(0), parameter1.value_or(0));
         break;
     default:
         success = false;
     }
 
     return success;
+}
+
+// Method Description:
+// - Starts a hyperlink
+// Arguments:
+// - The hyperlink URI, optional additional parameters
+// Return Value:
+// - true
+bool AdaptDispatch::AddHyperlink(const std::wstring_view uri, const std::wstring_view params)
+{
+    return _pConApi->PrivateAddHyperlink(uri, params);
+}
+
+// Method Description:
+// - Ends a hyperlink
+// Return Value:
+// - true
+bool AdaptDispatch::EndHyperlink()
+{
+    return _pConApi->PrivateEndHyperlink();
+}
+
+// Routine Description:
+// - Determines whether we should pass any sequence that manipulates
+//   TerminalInput's input generator through the PTY. It encapsulates
+//   a check for whether the PTY is in use.
+// Return value:
+// True if the request should be passed.
+bool AdaptDispatch::_ShouldPassThroughInputModeChange() const
+{
+    // If we're a conpty, AND WE'RE IN VT INPUT MODE, always pass input mode requests
+    // The VT Input mode check is to work around ssh.exe v7.7, which uses VT
+    // output, but not Input.
+    // The original comment said, "Once the conpty supports these types of input,
+    // this check can be removed. See GH#4911". Unfortunately, time has shown
+    // us that SSH 7.7 _also_ requests mouse input and that can have a user interface
+    // impact on the actual connected terminal. We can't remove this check,
+    // because SSH <=7.7 is out in the wild on all versions of Windows <=2004.
+    return _pConApi->IsConsolePty() && _pConApi->PrivateIsVtInputEnabled();
 }

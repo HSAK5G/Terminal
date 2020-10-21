@@ -3,19 +3,96 @@
 
 #pragma once
 
-#include "point.h"
-#include "size.h"
-#include "some.h"
-
 #ifdef UNIT_TESTING
 class RectangleTests;
 #endif
 
 namespace til // Terminal Implementation Library. Also: "Today I Learned"
 {
+    namespace details
+    {
+        class _rectangle_const_iterator
+        {
+        public:
+            constexpr _rectangle_const_iterator(point topLeft, point bottomRight) :
+                _topLeft(topLeft),
+                _bottomRight(bottomRight),
+                _current(topLeft)
+            {
+            }
+
+            constexpr _rectangle_const_iterator(point topLeft, point bottomRight, point start) :
+                _topLeft(topLeft),
+                _bottomRight(bottomRight),
+                _current(start)
+            {
+            }
+
+            _rectangle_const_iterator& operator++()
+            {
+                ptrdiff_t nextX;
+                THROW_HR_IF(E_ABORT, !::base::CheckAdd(_current.x(), 1).AssignIfValid(&nextX));
+
+                if (nextX >= _bottomRight.x())
+                {
+                    ptrdiff_t nextY;
+                    THROW_HR_IF(E_ABORT, !::base::CheckAdd(_current.y(), 1).AssignIfValid(&nextY));
+                    // Note for the standard Left-to-Right, Top-to-Bottom walk,
+                    // the end position is one cell below the bottom left.
+                    // (or more accurately, on the exclusive bottom line in the inclusive left column.)
+                    _current = { _topLeft.x(), nextY };
+                }
+                else
+                {
+                    _current = { nextX, _current.y() };
+                }
+
+                return (*this);
+            }
+
+            constexpr bool operator==(const _rectangle_const_iterator& other) const
+            {
+                return _current == other._current &&
+                       _topLeft == other._topLeft &&
+                       _bottomRight == other._bottomRight;
+            }
+
+            constexpr bool operator!=(const _rectangle_const_iterator& other) const
+            {
+                return !(*this == other);
+            }
+
+            constexpr bool operator<(const _rectangle_const_iterator& other) const
+            {
+                return _current < other._current;
+            }
+
+            constexpr bool operator>(const _rectangle_const_iterator& other) const
+            {
+                return _current > other._current;
+            }
+
+            constexpr point operator*() const
+            {
+                return _current;
+            }
+
+        protected:
+            point _current;
+            const point _topLeft;
+            const point _bottomRight;
+
+#ifdef UNIT_TESTING
+            friend class ::RectangleTests;
+#endif
+        };
+    }
+
     class rectangle
     {
     public:
+        using const_iterator = details::_rectangle_const_iterator;
+
         constexpr rectangle() noexcept :
             rectangle(til::point{ 0, 0 }, til::point{ 0, 0 })
         {
@@ -98,6 +175,22 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         {
         }
 
+        // This template will convert to rectangle from anything that has a Left, Top, Right, and Bottom field that are floating-point;
+        // a math type is required.
+        template<typename TilMath, typename TOther>
+        constexpr rectangle(TilMath, const TOther& other, std::enable_if_t<std::is_floating_point_v<decltype(std::declval<TOther>().Left)> && std::is_floating_point_v<decltype(std::declval<TOther>().Top)> && std::is_floating_point_v<decltype(std::declval<TOther>().Right)> && std::is_floating_point_v<decltype(std::declval<TOther>().Bottom)>, int> /*sentinel*/ = 0) :
+            rectangle(til::point{ TilMath::template cast<ptrdiff_t>(other.Left), TilMath::template cast<ptrdiff_t>(other.Top) }, til::point{ TilMath::template cast<ptrdiff_t>(other.Right), TilMath::template cast<ptrdiff_t>(other.Bottom) })
+        {
+        }
+
+        // This template will convert to rectangle from anything that has a left, top, right, and bottom field that are floating-point;
+        // a math type is required.
+        template<typename TilMath, typename TOther>
+        constexpr rectangle(TilMath, const TOther& other, std::enable_if_t<std::is_floating_point_v<decltype(std::declval<TOther>().left)> && std::is_floating_point_v<decltype(std::declval<TOther>().top)> && std::is_floating_point_v<decltype(std::declval<TOther>().right)> && std::is_floating_point_v<decltype(std::declval<TOther>().bottom)>, int> /*sentinel*/ = 0) :
+            rectangle(til::point{ TilMath::template cast<ptrdiff_t>(other.left), TilMath::template cast<ptrdiff_t>(other.top) }, til::point{ TilMath::template cast<ptrdiff_t>(other.right), TilMath::template cast<ptrdiff_t>(other.bottom) })
+        {
+        }
+
         constexpr bool operator==(const rectangle& other) const noexcept
         {
             return _topLeft == other._topLeft &&
@@ -109,12 +202,29 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return !(*this == other);
         }
 
-        constexpr operator bool() const noexcept
+        explicit constexpr operator bool() const noexcept
         {
             return _topLeft.x() < _bottomRight.x() &&
                    _topLeft.y() < _bottomRight.y();
         }
 
+        constexpr const_iterator begin() const
+        {
+            return const_iterator(_topLeft, _bottomRight);
+        }
+
+        constexpr const_iterator end() const
+        {
+            // For the standard walk: Left-To-Right then Top-To-Bottom
+            // the end box is one cell below the left most column.
+            // |----|  5x2 square. Remember bottom & right are exclusive
+            // |    |  while top & left are inclusive.
+            // X-----  X is the end position.
+
+            return const_iterator(_topLeft, _bottomRight, { _topLeft.x(), _bottomRight.y() });
+        }
+
+#pragma region RECTANGLE OPERATORS
         // OR = union
         constexpr rectangle operator|(const rectangle& other) const noexcept
         {
@@ -147,6 +257,12 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return rectangle{ l, t, r, b };
         }
 
+        constexpr rectangle& operator|=(const rectangle& other) noexcept
+        {
+            *this = *this | other;
+            return *this;
+        }
+
         // AND = intersect
         constexpr rectangle operator&(const rectangle& other) const noexcept
         {
@@ -169,6 +285,12 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             }
 
             return rectangle{ l, t, r, b };
+        }
+
+        constexpr rectangle& operator&=(const rectangle& other) noexcept
+        {
+            *this = *this & other;
+            return *this;
         }
 
         // - = subtract
@@ -302,6 +424,263 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
 
             return result;
         }
+#pragma endregion
+
+#pragma region RECTANGLE VS POINT
+        // ADD will translate (offset) the rectangle by the point.
+        rectangle operator+(const point& point) const
+        {
+            ptrdiff_t l, t, r, b;
+
+            THROW_HR_IF(E_ABORT, !::base::CheckAdd(left(), point.x()).AssignIfValid(&l));
+            THROW_HR_IF(E_ABORT, !::base::CheckAdd(top(), point.y()).AssignIfValid(&t));
+            THROW_HR_IF(E_ABORT, !::base::CheckAdd(right(), point.x()).AssignIfValid(&r));
+            THROW_HR_IF(E_ABORT, !::base::CheckAdd(bottom(), point.y()).AssignIfValid(&b));
+
+            return til::rectangle{ til::point{ l, t }, til::point{ r, b } };
+        }
+
+        rectangle& operator+=(const point& point)
+        {
+            *this = *this + point;
+            return *this;
+        }
+
+        // SUB will translate (offset) the rectangle by the point.
+        rectangle operator-(const point& point) const
+        {
+            ptrdiff_t l, t, r, b;
+
+            THROW_HR_IF(E_ABORT, !::base::CheckSub(left(), point.x()).AssignIfValid(&l));
+            THROW_HR_IF(E_ABORT, !::base::CheckSub(top(), point.y()).AssignIfValid(&t));
+            THROW_HR_IF(E_ABORT, !::base::CheckSub(right(), point.x()).AssignIfValid(&r));
+            THROW_HR_IF(E_ABORT, !::base::CheckSub(bottom(), point.y()).AssignIfValid(&b));
+
+            return til::rectangle{ til::point{ l, t }, til::point{ r, b } };
+        }
+
+        rectangle& operator-=(const point& point)
+        {
+            *this = *this - point;
+            return *this;
+        }
+
+#pragma endregion
+
+#pragma region RECTANGLE VS SIZE
+        // ADD will grow the total area of the rectangle. The sign is the direction to grow.
+        rectangle operator+(const size& size) const
+        {
+            // Fetch the pieces of the rectangle.
+            auto l = left();
+            auto r = right();
+            auto t = top();
+            auto b = bottom();
+
+            // Fetch the scale factors we're using.
+            const auto width = size.width();
+            const auto height = size.height();
+
+            // Since this is the add operation versus a size, the result
+            // should grow the total rectangle area.
+            // The sign determines which edge of the rectangle moves.
+            // We use the magnitude as how far to move.
+            if (width > 0)
+            {
+                // Adding the positive makes the rectangle "grow"
+                // because right stretches outward (to the right).
+                //
+                // Example with adding width 3...
+                // |-- x = origin
+                // V
+                // x---------|    x------------|
+                // |         |    |            |
+                // |         |    |            |
+                // |---------|    |------------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckAdd(r, width).AssignIfValid(&r));
+            }
+            else
+            {
+                // Adding the negative makes the rectangle "grow"
+                // because left stretches outward (to the left).
+                //
+                // Example with adding width -3...
+                // |-- x = origin
+                // V
+                // x---------|    |--x---------|
+                // |         |    |            |
+                // |         |    |            |
+                // |---------|    |------------|
+                // BEFORE             AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckAdd(l, width).AssignIfValid(&l));
+            }
+
+            if (height > 0)
+            {
+                // Adding the positive makes the rectangle "grow"
+                // because bottom stretches outward (to the down).
+                //
+                // Example with adding height 2...
+                // |-- x = origin
+                // V
+                // x---------|    x---------|
+                // |         |    |         |
+                // |         |    |         |
+                // |---------|    |         |
+                //                |         |
+                //                |---------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckAdd(b, height).AssignIfValid(&b));
+            }
+            else
+            {
+                // Adding the negative makes the rectangle "grow"
+                // because top stretches outward (to the up).
+                //
+                // Example with adding height -2...
+                // |-- x = origin
+                // |
+                // |              |---------|
+                // V              |         |
+                // x---------|    x         |
+                // |         |    |         |
+                // |         |    |         |
+                // |---------|    |---------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckAdd(t, height).AssignIfValid(&t));
+            }
+
+            return rectangle{ til::point{ l, t }, til::point{ r, b } };
+        }
+
+        rectangle& operator+=(const size& size)
+        {
+            *this = *this + size;
+            return *this;
+        }
+
+        // SUB will shrink the total area of the rectangle. The sign is the direction to shrink.
+        rectangle operator-(const size& size) const
+        {
+            // Fetch the pieces of the rectangle.
+            auto l = left();
+            auto r = right();
+            auto t = top();
+            auto b = bottom();
+
+            // Fetch the scale factors we're using.
+            const auto width = size.width();
+            const auto height = size.height();
+
+            // Since this is the subtract operation versus a size, the result
+            // should shrink the total rectangle area.
+            // The sign determines which edge of the rectangle moves.
+            // We use the magnitude as how far to move.
+            if (width > 0)
+            {
+                // Subtracting the positive makes the rectangle "shrink"
+                // because right pulls inward (to the left).
+                //
+                // Example with subtracting width 3...
+                // |-- x = origin
+                // V
+                // x---------|    x------|
+                // |         |    |      |
+                // |         |    |      |
+                // |---------|    |------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckSub(r, width).AssignIfValid(&r));
+            }
+            else
+            {
+                // Subtracting the negative makes the rectangle "shrink"
+                // because left pulls inward (to the right).
+                //
+                // Example with subtracting width -3...
+                // |-- x = origin
+                // V
+                // x---------|    x  |------|
+                // |         |       |      |
+                // |         |       |      |
+                // |---------|       |------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckSub(l, width).AssignIfValid(&l));
+            }
+
+            if (height > 0)
+            {
+                // Subtracting the positive makes the rectangle "shrink"
+                // because bottom pulls inward (to the up).
+                //
+                // Example with subtracting height 2...
+                // |-- x = origin
+                // V
+                // x---------|    x---------|
+                // |         |    |---------|
+                // |         |
+                // |---------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckSub(b, height).AssignIfValid(&b));
+            }
+            else
+            {
+                // Subtracting the positive makes the rectangle "shrink"
+                // because top pulls inward (to the down).
+                //
+                // Example with subtracting height -2...
+                // |-- x = origin
+                // V
+                // x---------|    x
+                // |         |
+                // |         |    |---------|
+                // |---------|    |---------|
+                // BEFORE         AFTER
+                THROW_HR_IF(E_ABORT, !base::CheckSub(t, height).AssignIfValid(&t));
+            }
+
+            return rectangle{ til::point{ l, t }, til::point{ r, b } };
+        }
+
+        rectangle& operator-=(const size& size)
+        {
+            *this = *this - size;
+            return *this;
+        }
+
+        // scale_up will scale the entire rectangle up by the size factor
+        // This includes moving the origin.
+        rectangle scale_up(const size& size) const
+        {
+            const auto topLeft = _topLeft * size;
+            const auto bottomRight = _bottomRight * size;
+            return til::rectangle{ topLeft, bottomRight };
+        }
+
+        // scale_down will scale the entire rectangle down by the size factor,
+        // but rounds the bottom-right corner out.
+        // This includes moving the origin.
+        rectangle scale_down(const size& size) const
+        {
+            auto topLeft = _topLeft;
+            auto bottomRight = _bottomRight;
+            topLeft = topLeft / size;
+
+            // Move bottom right point into a size
+            // Use size specialization of divide_ceil to round up against the size given.
+            // Add leading addition to point to convert it back into a point.
+            bottomRight = til::point{} + til::size{ right(), bottom() }.divide_ceil(size);
+
+            return til::rectangle{ topLeft, bottomRight };
+        }
+
+        template<typename TilMath>
+        rectangle scale(TilMath, const float scale) const
+        {
+            return til::rectangle{ _topLeft.scale(TilMath{}, scale), _bottomRight.scale(TilMath{}, scale) };
+        }
+
+#pragma endregion
 
         constexpr ptrdiff_t top() const noexcept
         {
@@ -400,6 +779,57 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return !operator bool();
         }
 
+        constexpr bool contains(til::point pt) const
+        {
+            return pt.x() >= _topLeft.x() && pt.x() < _bottomRight.x() &&
+                   pt.y() >= _topLeft.y() && pt.y() < _bottomRight.y();
+        }
+
+        bool contains(ptrdiff_t index) const
+        {
+            return index >= 0 && index < size().area();
+        }
+
+        constexpr bool contains(til::rectangle rc) const
+        {
+            // Union the other rectangle and ourselves.
+            // If the result of that didn't grow at all, then we already
+            // fully contained the rectangle we were given.
+            return (*this | rc) == *this;
+        }
+
+        ptrdiff_t index_of(til::point pt) const
+        {
+            THROW_HR_IF(E_INVALIDARG, !contains(pt));
+
+            // Take Y away from the top to find how many rows down
+            auto check = base::CheckSub(pt.y(), top());
+
+            // Multiply by the width because we've passed that many
+            // widths-worth of indices.
+            check *= width();
+
+            // Then add in the last few indices in the x position this row
+            // and subtract left to find the offset from left edge.
+            check = check + pt.x() - left();
+
+            ptrdiff_t result;
+            THROW_HR_IF(E_ABORT, !check.AssignIfValid(&result));
+            return result;
+        }
+
+        til::point point_at(ptrdiff_t index) const
+        {
+            THROW_HR_IF(E_INVALIDARG, !contains(index));
+
+            const auto div = std::div(index, width());
+
+            // Not checking math on these because we're presuming
+            // that the point can't be in bounds of a rectangle where
+            // this would overflow on addition after the division.
+            return til::point{ div.rem + left(), div.quot + top() };
+        }
+
 #ifdef _WINCONTYPES_
         // NOTE: This will convert back to INCLUSIVE on the way out because
         // that is generally how SMALL_RECTs are handled in console code and via the APIs.
@@ -433,6 +863,23 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
 #endif
 
+#ifdef WINRT_Windows_Foundation_H
+        operator winrt::Windows::Foundation::Rect() const
+        {
+            winrt::Windows::Foundation::Rect ret;
+            THROW_HR_IF(E_ABORT, !base::MakeCheckedNum(left()).AssignIfValid(&ret.X));
+            THROW_HR_IF(E_ABORT, !base::MakeCheckedNum(top()).AssignIfValid(&ret.Y));
+            THROW_HR_IF(E_ABORT, !base::MakeCheckedNum(width()).AssignIfValid(&ret.Width));
+            THROW_HR_IF(E_ABORT, !base::MakeCheckedNum(height()).AssignIfValid(&ret.Height));
+            return ret;
+        }
+#endif
+
+        std::wstring to_string() const
+        {
+            return wil::str_printf<std::wstring>(L"(L:%td, T:%td, R:%td, B:%td) [W:%td, H:%td]", left(), top(), right(), bottom(), width(), height());
+        }
+
     protected:
         til::point _topLeft;
         til::point _bottomRight;
@@ -452,7 +899,7 @@ namespace WEX::TestExecution
     public:
         static WEX::Common::NoThrowString ToString(const ::til::rectangle& rect)
         {
-            return WEX::Common::NoThrowString().Format(L"(L:%td, T:%td, R:%td, B:%td) [W:%td, H:%td]", rect.left(), rect.top(), rect.right(), rect.bottom(), rect.width(), rect.height());
+            return WEX::Common::NoThrowString(rect.to_string().c_str());
         }
     };
 

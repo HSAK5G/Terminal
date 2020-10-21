@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#include "precomp.h"
+#include "pch.h"
 #include <WexTestClass.h>
 
 #include "../cascadia/TerminalCore/Terminal.hpp"
@@ -9,7 +9,7 @@
 #include "../renderer/inc/DummyRenderTarget.hpp"
 #include "consoletaeftemplates.hpp"
 
-using namespace winrt::Microsoft::Terminal::Settings;
+using namespace winrt::Microsoft::Terminal::TerminalControl;
 using namespace Microsoft::Terminal::Core;
 
 using namespace WEX::Logging;
@@ -33,6 +33,11 @@ namespace TerminalCoreUnitTests
         // This test ensures that Terminal::_WriteBuffer doesn't get stuck when
         // PrintString() is called with more code units than the buffer width.
         TEST_METHOD(PrintStringOfSurrogatePairs);
+        TEST_METHOD(CheckDoubleWidthCursor);
+
+        TEST_METHOD(AddHyperlink);
+        TEST_METHOD(AddHyperlinkCustomId);
+        TEST_METHOD(AddHyperlinkCustomIdDifferentUri);
     };
 };
 
@@ -207,4 +212,130 @@ void TerminalApiTest::CursorVisibilityViaStateMachine()
     VERIFY_IS_TRUE(cursor.IsOn());
     VERIFY_IS_FALSE(cursor.IsBlinkingAllowed());
     VERIFY_IS_FALSE(cursor.IsVisible());
+}
+
+void TerminalApiTest::CheckDoubleWidthCursor()
+{
+    DummyRenderTarget renderTarget;
+    Terminal term;
+    term.Create({ 100, 100 }, 0, renderTarget);
+
+    auto& tbi = *(term._buffer);
+    auto& stateMachine = *(term._stateMachine);
+    auto& cursor = tbi.GetCursor();
+
+    // Lets stuff the buffer with single width characters,
+    // but leave the last two columns empty for double width.
+    std::wstring singleWidthText;
+    singleWidthText.reserve(98);
+    for (size_t i = 0; i < 98; ++i)
+    {
+        singleWidthText.append(L"A");
+    }
+    stateMachine.ProcessString(singleWidthText);
+    VERIFY_IS_TRUE(cursor.GetPosition().X == 98);
+
+    // Stuff two double width characters.
+    std::wstring doubleWidthText{ L"我愛" };
+    stateMachine.ProcessString(doubleWidthText);
+
+    // The last 'A'
+    term.SetCursorPosition(97, 0);
+    VERIFY_IS_FALSE(term.IsCursorDoubleWidth());
+
+    // This and the next CursorPos are taken up by '我‘
+    term.SetCursorPosition(98, 0);
+    VERIFY_IS_TRUE(term.IsCursorDoubleWidth());
+    term.SetCursorPosition(99, 0);
+    VERIFY_IS_TRUE(term.IsCursorDoubleWidth());
+
+    // This and the next CursorPos are taken up by ’愛‘
+    term.SetCursorPosition(0, 1);
+    VERIFY_IS_TRUE(term.IsCursorDoubleWidth());
+    term.SetCursorPosition(1, 1);
+    VERIFY_IS_TRUE(term.IsCursorDoubleWidth());
+}
+
+void TerminalCoreUnitTests::TerminalApiTest::AddHyperlink()
+{
+    // This is a nearly literal copy-paste of ScreenBufferTests::TestAddHyperlink, adapted for the Terminal
+
+    Terminal term;
+    DummyRenderTarget emptyRT;
+    term.Create({ 100, 100 }, 0, emptyRT);
+
+    auto& tbi = *(term._buffer);
+    auto& stateMachine = *(term._stateMachine);
+
+    // Process the opening osc 8 sequence
+    stateMachine.ProcessString(L"\x1b]8;;test.url\x9c");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"test.url");
+
+    // Send any other text
+    stateMachine.ProcessString(L"Hello World");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"test.url");
+
+    // Process the closing osc 8 sequences
+    stateMachine.ProcessString(L"\x1b]8;;\x9c");
+    VERIFY_IS_FALSE(tbi.GetCurrentAttributes().IsHyperlink());
+}
+
+void TerminalCoreUnitTests::TerminalApiTest::AddHyperlinkCustomId()
+{
+    // This is a nearly literal copy-paste of ScreenBufferTests::TestAddHyperlinkCustomId, adapted for the Terminal
+
+    Terminal term;
+    DummyRenderTarget emptyRT;
+    term.Create({ 100, 100 }, 0, emptyRT);
+
+    auto& tbi = *(term._buffer);
+    auto& stateMachine = *(term._stateMachine);
+
+    // Process the opening osc 8 sequence
+    stateMachine.ProcessString(L"\x1b]8;id=myId;test.url\x9c");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"test.url");
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkId(L"test.url", L"myId"), tbi.GetCurrentAttributes().GetHyperlinkId());
+
+    // Send any other text
+    stateMachine.ProcessString(L"Hello World");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"test.url");
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkId(L"test.url", L"myId"), tbi.GetCurrentAttributes().GetHyperlinkId());
+
+    // Process the closing osc 8 sequences
+    stateMachine.ProcessString(L"\x1b]8;;\x9c");
+    VERIFY_IS_FALSE(tbi.GetCurrentAttributes().IsHyperlink());
+}
+
+void TerminalCoreUnitTests::TerminalApiTest::AddHyperlinkCustomIdDifferentUri()
+{
+    // This is a nearly literal copy-paste of ScreenBufferTests::TestAddHyperlinkCustomId, adapted for the Terminal
+
+    Terminal term;
+    DummyRenderTarget emptyRT;
+    term.Create({ 100, 100 }, 0, emptyRT);
+
+    auto& tbi = *(term._buffer);
+    auto& stateMachine = *(term._stateMachine);
+
+    // Process the opening osc 8 sequence
+    stateMachine.ProcessString(L"\x1b]8;id=myId;test.url\x9c");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"test.url");
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkId(L"test.url", L"myId"), tbi.GetCurrentAttributes().GetHyperlinkId());
+
+    const auto oldAttributes{ tbi.GetCurrentAttributes() };
+
+    // Send any other text
+    stateMachine.ProcessString(L"\x1b]8;id=myId;other.url\x9c");
+    VERIFY_IS_TRUE(tbi.GetCurrentAttributes().IsHyperlink());
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(tbi.GetCurrentAttributes().GetHyperlinkId()), L"other.url");
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkId(L"other.url", L"myId"), tbi.GetCurrentAttributes().GetHyperlinkId());
+
+    // This second URL should not change the URL of the original ID!
+    VERIFY_ARE_EQUAL(tbi.GetHyperlinkUriFromId(oldAttributes.GetHyperlinkId()), L"test.url");
+    VERIFY_ARE_NOT_EQUAL(oldAttributes.GetHyperlinkId(), tbi.GetCurrentAttributes().GetHyperlinkId());
 }

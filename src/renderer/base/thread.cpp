@@ -26,6 +26,7 @@ RenderThread::~RenderThread()
     if (_hThread)
     {
         _fKeepRunning = false; // stop loop after final run
+        EnablePainting(); // if we want to get the last frame out, we need to make sure it's enabled
         SignalObjectAndWait(_hEvent, _hThread, INFINITE, FALSE); // signal final paint and wait for thread to finish.
 
         CloseHandle(_hThread);
@@ -161,17 +162,17 @@ DWORD WINAPI RenderThread::_ThreadProc()
     {
         WaitForSingleObject(_hPaintEnabledEvent, INFINITE);
 
-        if (!_fNextFrameRequested.exchange(false))
+        if (!_fNextFrameRequested.exchange(false, std::memory_order_acq_rel))
         {
             // <--
             // If `NotifyPaint` is called at this point, then it will not
             // set the event because `_fWaiting` is not `true` yet so we have
             // to check again below.
 
-            _fWaiting.store(true);
+            _fWaiting.store(true, std::memory_order_release);
 
             // check again now (see comment above)
-            if (!_fNextFrameRequested.exchange(false))
+            if (!_fNextFrameRequested.exchange(false, std::memory_order_acq_rel))
             {
                 // Wait until a next frame is requested.
                 WaitForSingleObject(_hEvent, INFINITE);
@@ -192,7 +193,7 @@ DWORD WINAPI RenderThread::_ThreadProc()
             // expensive operation, we should reset the event to not render
             // again if nothing changed.
 
-            _fWaiting.store(false);
+            _fWaiting.store(false, std::memory_order_release);
 
             // see comment above
             ResetEvent(_hEvent);
@@ -200,6 +201,7 @@ DWORD WINAPI RenderThread::_ThreadProc()
 
         ResetEvent(_hPaintCompletedEvent);
 
+        _pRenderer->WaitUntilCanRender();
         LOG_IF_FAILED(_pRenderer->PaintFrame());
 
         SetEvent(_hPaintCompletedEvent);
@@ -216,19 +218,24 @@ DWORD WINAPI RenderThread::_ThreadProc()
 
 void RenderThread::NotifyPaint()
 {
-    if (_fWaiting.load())
+    if (_fWaiting.load(std::memory_order_acquire))
     {
         SetEvent(_hEvent);
     }
     else
     {
-        _fNextFrameRequested.store(true);
+        _fNextFrameRequested.store(true, std::memory_order_release);
     }
 }
 
 void RenderThread::EnablePainting()
 {
     SetEvent(_hPaintEnabledEvent);
+}
+
+void RenderThread::DisablePainting()
+{
+    ResetEvent(_hPaintEnabledEvent);
 }
 
 void RenderThread::WaitForPaintCompletionAndDisable(const DWORD dwTimeoutMs)

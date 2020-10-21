@@ -18,6 +18,9 @@
     <ClCompile Include="..\convert.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\colorTable.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\MouseEvent.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -63,9 +66,6 @@
     <ClCompile Include="..\UiaTextRangeBase.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\WindowUiaProviderBase.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\ThemeUtils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -92,6 +92,9 @@
     <ClInclude Include="..\inc\convert.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\inc\colorTable.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\precomp.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -104,19 +107,10 @@
     <ClInclude Include="..\inc\GlyphWidth.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\IConsoleWindow.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="..\IControlAccessibilityInfo.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\UiaTextRangeBase.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\WindowUiaProviderBase.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\IConsoleWindow.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\inc\CodepointWidthDetector.hpp">
@@ -143,16 +137,10 @@
     <ClInclude Include="..\ScreenInfoUiaProviderBase.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\WindowUiaProviderBase.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="..\TermControlUiaProvider.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\TermControlUiaTextRange.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\IUiaWindow.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\IUiaData.h">
@@ -174,6 +162,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\UiaTracing.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\IUiaTraceable.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

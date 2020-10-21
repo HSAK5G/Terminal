@@ -16,17 +16,78 @@ using namespace ::Microsoft::Terminal::Core;
 
 static LPCWSTR term_window_class = L"HwndTerminalClass";
 
+// This magic flag is "documented" at https://msdn.microsoft.com/en-us/library/windows/desktop/ms646301(v=vs.85).aspx
+// "If the high-order bit is 1, the key is down; otherwise, it is up."
+static constexpr short KeyPressed{ gsl::narrow_cast<short>(0x8000) };
+
+static constexpr bool _IsMouseMessage(UINT uMsg)
+{
+    return uMsg == WM_LBUTTONDOWN || uMsg == WM_LBUTTONUP || uMsg == WM_LBUTTONDBLCLK ||
+           uMsg == WM_MBUTTONDOWN || uMsg == WM_MBUTTONUP || uMsg == WM_MBUTTONDBLCLK ||
+           uMsg == WM_RBUTTONDOWN || uMsg == WM_RBUTTONUP || uMsg == WM_RBUTTONDBLCLK ||
+           uMsg == WM_MOUSEMOVE || uMsg == WM_MOUSEWHEEL || uMsg == WM_MOUSEHWHEEL;
+}
+
+// Helper static function to ensure that all ambiguous-width glyphs are reported as narrow.
+// See microsoft/terminal#2066 for more info.
+static bool _IsGlyphWideForceNarrowFallback(const std::wstring_view /* glyph */) noexcept
+{
+    return false; // glyph is not wide.
+}
+
+static bool _EnsureStaticInitialization()
+{
+    // use C++11 magic statics to make sure we only do this once.
+    static bool initialized = []() {
+        // *** THIS IS A SINGLETON ***
+        SetGlyphWidthFallback(_IsGlyphWideForceNarrowFallback);
+
+        return true;
+    }();
+    return initialized;
+}
+
 LRESULT CALLBACK HwndTerminal::HwndTerminalWndProc(
     HWND hwnd,
     UINT uMsg,
     WPARAM wParam,
     LPARAM lParam) noexcept
+try
 {
 #pragma warning(suppress : 26490) // Win32 APIs can only store void*, have to use reinterpret_cast
     HwndTerminal* terminal = reinterpret_cast<HwndTerminal*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 
     if (terminal)
     {
+        if (_IsMouseMessage(uMsg))
+        {
+            if (terminal->_CanSendVTMouseInput() && terminal->_SendMouseEvent(uMsg, wParam, lParam))
+            {
+                // GH#6401: Capturing the mouse ensures that we get drag/release events
+                // even if the user moves outside the window.
+                // _SendMouseEvent returns false if the terminal's not in VT mode, so we'll
+                // fall through to release the capture.
+                switch (uMsg)
+                {
+                case WM_LBUTTONDOWN:
+                case WM_MBUTTONDOWN:
+                case WM_RBUTTONDOWN:
+                    SetCapture(hwnd);
+                    break;
+                case WM_LBUTTONUP:
+                case WM_MBUTTONUP:
+                case WM_RBUTTONUP:
+                    ReleaseCapture();
+                    break;
+                default:
+                    break;
+                }
+
+                // Suppress all mouse events that made it into the terminal.
+                return 0;
+            }
+        }
+
         switch (uMsg)
         {
         case WM_GETOBJECT:
@@ -38,6 +99,13 @@ LRESULT CALLBACK HwndTerminal::HwndTerminalWndProc(
         case WM_LBUTTONDOWN:
             LOG_IF_FAILED(terminal->_StartSelection(lParam));
             return 0;
+        case WM_LBUTTONUP:
+            terminal->_singleClickTouchdownPos = std::nullopt;
+            [[fallthrough]];
+        case WM_MBUTTONUP:
+        case WM_RBUTTONUP:
+            ReleaseCapture();
+            break;
         case WM_MOUSEMOVE:
             if (WI_IsFlagSet(wParam, MK_LBUTTON))
             {
@@ -52,7 +120,7 @@ LRESULT CALLBACK HwndTerminal::HwndTerminalWndProc(
                 {
                     const auto bufferData = terminal->_terminal->RetrieveSelectedTextFromBuffer(false);
                     LOG_IF_FAILED(terminal->_CopyTextToSystemClipboard(bufferData, true));
-                    terminal->_terminal->ClearSelection();
+                    TerminalClearSelection(terminal);
                 }
                 CATCH_LOG();
             }
@@ -61,9 +129,21 @@ LRESULT CALLBACK HwndTerminal::HwndTerminalWndProc(
                 terminal->_PasteTextFromClipboard();
             }
             return 0;
+        case WM_DESTROY:
+            // Release Terminal's hwnd so Teardown doesn't try to destroy it again
+            terminal->_hwnd.release();
+            terminal->Teardown();
+            return 0;
+        default:
+            break;
         }
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+catch (...)
+{
+    LOG_CAUGHT_EXCEPTION();
+    return 0;
 }
 
 static bool RegisterTermClass(HINSTANCE hInstance) noexcept
@@ -89,13 +169,16 @@ static bool RegisterTermClass(HINSTANCE hInstance) noexcept
 }
 
 HwndTerminal::HwndTerminal(HWND parentHwnd) :
-    _desiredFont{ DEFAULT_FONT_FACE, 0, 10, { 0, 14 }, CP_UTF8 },
-    _actualFont{ DEFAULT_FONT_FACE, 0, 10, { 0, 14 }, CP_UTF8, false },
+    _desiredFont{ L"Consolas", 0, DEFAULT_FONT_WEIGHT, { 0, 14 }, CP_UTF8 },
+    _actualFont{ L"Consolas", 0, DEFAULT_FONT_WEIGHT, { 0, 14 }, CP_UTF8, false },
     _uiaProvider{ nullptr },
     _uiaProviderInitialized{ false },
     _currentDpi{ USER_DEFAULT_SCREEN_DPI },
-    _pfnWriteCallback{ nullptr }
+    _pfnWriteCallback{ nullptr },
+    _multiClickTime{ 500 } // this will be overwritten by the windows system double-click time
 {
+    _EnsureStaticInitialization();
+
     HINSTANCE hInstance = wil::GetModuleInstanceHandle();
 
     if (RegisterTermClass(hInstance))
@@ -122,6 +205,11 @@ HwndTerminal::HwndTerminal(HWND parentHwnd) :
     }
 }
 
+HwndTerminal::~HwndTerminal()
+{
+    Teardown();
+}
+
 HRESULT HwndTerminal::Initialize()
 {
     _terminal = std::make_unique<::Microsoft::Terminal::Core::Terminal>();
@@ -135,9 +223,6 @@ HRESULT HwndTerminal::Initialize()
     RETURN_IF_FAILED(dxEngine->SetHwnd(_hwnd.get()));
     RETURN_IF_FAILED(dxEngine->Enable());
     _renderer->AddRenderEngine(dxEngine.get());
-
-    const auto pfn = std::bind(&::Microsoft::Console::Render::Renderer::IsGlyphWideByFont, _renderer.get(), std::placeholders::_1);
-    SetGlyphWidthFallback(pfn);
 
     _UpdateFont(USER_DEFAULT_SCREEN_DPI);
     RECT windowRect;
@@ -155,13 +240,42 @@ HRESULT HwndTerminal::Initialize()
     _terminal->SetBackgroundCallback([](auto) {});
 
     _terminal->Create(COORD{ 80, 25 }, 1000, *_renderer);
-    _terminal->SetDefaultBackground(RGB(5, 27, 80));
-    _terminal->SetDefaultForeground(RGB(255, 255, 255));
-    _terminal->SetWriteInputCallback([=](std::wstring & input) noexcept { _WriteTextToConnection(input); });
+    _terminal->SetDefaultBackground(RGB(12, 12, 12));
+    _terminal->SetDefaultForeground(RGB(204, 204, 204));
+    _terminal->SetWriteInputCallback([=](std::wstring& input) noexcept { _WriteTextToConnection(input); });
     localPointerToThread->EnablePainting();
+
+    _multiClickTime = std::chrono::milliseconds{ GetDoubleClickTime() };
 
     return S_OK;
 }
+
+void HwndTerminal::Teardown() noexcept
+try
+{
+    // As a rule, detach resources from the Terminal before shutting them down.
+    // This ensures that teardown is reentrant.
+
+    // Shut down the renderer (and therefore the thread) before we implode
+    if (auto localRenderEngine{ std::exchange(_renderEngine, nullptr) })
+    {
+        if (auto localRenderer{ std::exchange(_renderer, nullptr) })
+        {
+            localRenderer->TriggerTeardown();
+            // renderer is destroyed
+        }
+        // renderEngine is destroyed
+    }
+
+    if (auto localHwnd{ _hwnd.release() })
+    {
+        // If we're being called through WM_DESTROY, we won't get here (hwnd is already released)
+        // If we're not, we may end up in Teardown _again_... but by the time we do, all other
+        // resources have been released and will not be released again.
+        DestroyWindow(localHwnd);
+    }
+}
+CATCH_LOG();
 
 void HwndTerminal::RegisterScrollCallback(std::function<void(int, int, int)> callback)
 {
@@ -241,6 +355,8 @@ HRESULT HwndTerminal::Refresh(const SIZE windowSize, _Out_ COORD* dimensions)
 
     auto lock = _terminal->LockForWriting();
 
+    _terminal->ClearSelection();
+
     RETURN_IF_FAILED(_renderEngine->SetWindowSize(windowSize));
 
     // Invalidate everything
@@ -289,7 +405,7 @@ HRESULT _stdcall CreateTerminal(HWND parentHwnd, _Out_ void** hwnd, _Out_ void**
         parentHwnd,
         nullptr,
         nullptr,
-        0);
+        nullptr);
     auto _terminal = std::make_unique<HwndTerminal>(_hostWindow);
     RETURN_IF_FAILED(_terminal->Initialize());
 
@@ -317,7 +433,15 @@ void _stdcall TerminalSendOutput(void* terminal, LPCWSTR data)
     publicTerminal->SendOutput(data);
 }
 
-HRESULT _stdcall TerminalTriggerResize(void* terminal, double width, double height, _Out_ COORD* dimensions)
+/// <summary>
+/// Triggers a terminal resize using the new width and height in pixel.
+/// </summary>
+/// <param name="terminal">Terminal pointer.</param>
+/// <param name="width">New width of the terminal in pixels.</param>
+/// <param name="height">New height of the terminal in pixels</param>
+/// <param name="dimensions">Out parameter containing the columns and rows that fit the new size.</param>
+/// <returns>HRESULT of the attempted resize.</returns>
+HRESULT _stdcall TerminalTriggerResize(_In_ void* terminal, _In_ short width, _In_ short height, _Out_ COORD* dimensions)
 {
     const auto publicTerminal = static_cast<HwndTerminal*>(terminal);
 
@@ -330,8 +454,53 @@ HRESULT _stdcall TerminalTriggerResize(void* terminal, double width, double heig
         static_cast<int>(height),
         0));
 
-    const SIZE windowSize{ static_cast<short>(width), static_cast<short>(height) };
+    const SIZE windowSize{ width, height };
     return publicTerminal->Refresh(windowSize, dimensions);
+}
+
+/// <summary>
+/// Helper method for resizing the terminal using character column and row counts
+/// </summary>
+/// <param name="terminal">Pointer to the terminal object.</param>
+/// <param name="dimensionsInCharacters">New terminal size in row and column count.</param>
+/// <param name="dimensionsInPixels">Out parameter with the new size of the renderer.</param>
+/// <returns>HRESULT of the attempted resize.</returns>
+HRESULT _stdcall TerminalTriggerResizeWithDimension(_In_ void* terminal, _In_ COORD dimensionsInCharacters, _Out_ SIZE* dimensionsInPixels)
+{
+    RETURN_HR_IF_NULL(E_INVALIDARG, dimensionsInPixels);
+
+    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
+
+    const auto viewInCharacters = Viewport::FromDimensions({ 0, 0 }, { (dimensionsInCharacters.X), (dimensionsInCharacters.Y) });
+    const auto viewInPixels = publicTerminal->_renderEngine->GetViewportInPixels(viewInCharacters);
+
+    dimensionsInPixels->cx = viewInPixels.Width();
+    dimensionsInPixels->cy = viewInPixels.Height();
+
+    COORD unused{ 0, 0 };
+
+    return TerminalTriggerResize(terminal, viewInPixels.Width(), viewInPixels.Height(), &unused);
+}
+
+/// <summary>
+/// Calculates the amount of rows and columns that fit in the provided width and height.
+/// </summary>
+/// <param name="terminal">Terminal pointer</param>
+/// <param name="width">Width of the terminal area to calculate.</param>
+/// <param name="height">Height of the terminal area to calculate.</param>
+/// <param name="dimensions">Out parameter containing the columns and rows that fit the new size.</param>
+/// <returns>HRESULT of the calculation.</returns>
+HRESULT _stdcall TerminalCalculateResize(_In_ void* terminal, _In_ short width, _In_ short height, _Out_ COORD* dimensions)
+{
+    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
+
+    const auto viewInPixels = Viewport::FromDimensions({ 0, 0 }, { width, height });
+    const auto viewInCharacters = publicTerminal->_renderEngine->GetViewportInCharacters(viewInPixels);
+
+    dimensions->X = viewInCharacters.Width();
+    dimensions->Y = viewInCharacters.Height();
+
+    return S_OK;
 }
 
 void _stdcall TerminalDpiChanged(void* terminal, int newDpi)
@@ -346,26 +515,59 @@ void _stdcall TerminalUserScroll(void* terminal, int viewTop)
     publicTerminal->_terminal->UserScrollViewport(viewTop);
 }
 
+const unsigned int HwndTerminal::_NumberOfClicks(til::point point, std::chrono::steady_clock::time_point timestamp) noexcept
+{
+    // if click occurred at a different location or past the multiClickTimer...
+    const auto delta{ timestamp - _lastMouseClickTimestamp };
+    if (point != _lastMouseClickPos || delta > _multiClickTime)
+    {
+        // exit early. This is a single click.
+        _multiClickCounter = 1;
+    }
+    else
+    {
+        _multiClickCounter++;
+    }
+    return _multiClickCounter;
+}
+
 HRESULT HwndTerminal::_StartSelection(LPARAM lParam) noexcept
 try
 {
-    const bool altPressed = GetKeyState(VK_MENU) < 0;
-    COORD cursorPosition{
+    const til::point cursorPosition{
         GET_X_LPARAM(lParam),
         GET_Y_LPARAM(lParam),
     };
 
-    const auto fontSize = this->_actualFont.GetSize();
+    auto lock = _terminal->LockForWriting();
+    const bool altPressed = GetKeyState(VK_MENU) < 0;
+    const til::size fontSize{ this->_actualFont.GetSize() };
 
-    RETURN_HR_IF(E_NOT_VALID_STATE, fontSize.X == 0);
-    RETURN_HR_IF(E_NOT_VALID_STATE, fontSize.Y == 0);
-
-    cursorPosition.X /= fontSize.X;
-    cursorPosition.Y /= fontSize.Y;
-
-    this->_terminal->SetSelectionAnchor(cursorPosition);
     this->_terminal->SetBlockSelection(altPressed);
 
+    const auto clickCount{ _NumberOfClicks(cursorPosition, std::chrono::steady_clock::now()) };
+
+    // This formula enables the number of clicks to cycle properly between single-, double-, and triple-click.
+    // To increase the number of acceptable click states, simply increment MAX_CLICK_COUNT and add another if-statement
+    const unsigned int MAX_CLICK_COUNT = 3;
+    const auto multiClickMapper = clickCount > MAX_CLICK_COUNT ? ((clickCount + MAX_CLICK_COUNT - 1) % MAX_CLICK_COUNT) + 1 : clickCount;
+
+    if (multiClickMapper == 3)
+    {
+        _terminal->MultiClickSelection(cursorPosition / fontSize, ::Terminal::SelectionExpansionMode::Line);
+    }
+    else if (multiClickMapper == 2)
+    {
+        _terminal->MultiClickSelection(cursorPosition / fontSize, ::Terminal::SelectionExpansionMode::Word);
+    }
+    else
+    {
+        this->_terminal->ClearSelection();
+        _singleClickTouchdownPos = cursorPosition;
+
+        _lastMouseClickTimestamp = std::chrono::steady_clock::now();
+        _lastMouseClickPos = cursorPosition;
+    }
     this->_renderer->TriggerSelection();
 
     return S_OK;
@@ -375,31 +577,50 @@ CATCH_RETURN();
 HRESULT HwndTerminal::_MoveSelection(LPARAM lParam) noexcept
 try
 {
-    COORD cursorPosition{
+    const til::point cursorPosition{
         GET_X_LPARAM(lParam),
         GET_Y_LPARAM(lParam),
     };
 
-    const auto fontSize = this->_actualFont.GetSize();
+    auto lock = _terminal->LockForWriting();
+    const til::size fontSize{ this->_actualFont.GetSize() };
 
-    RETURN_HR_IF(E_NOT_VALID_STATE, fontSize.X == 0);
-    RETURN_HR_IF(E_NOT_VALID_STATE, fontSize.Y == 0);
+    RETURN_HR_IF(E_NOT_VALID_STATE, fontSize.area() == 0); // either dimension = 0, area == 0
 
-    cursorPosition.X /= fontSize.X;
-    cursorPosition.Y /= fontSize.Y;
+    if (this->_singleClickTouchdownPos)
+    {
+        const auto& touchdownPoint{ *this->_singleClickTouchdownPos };
+        const auto distance{ std::sqrtf(std::powf(cursorPosition.x<float>() - touchdownPoint.x<float>(), 2) + std::powf(cursorPosition.y<float>() - touchdownPoint.y<float>(), 2)) };
+        if (distance >= (std::min(fontSize.width(), fontSize.height()) / 4.f))
+        {
+            _terminal->SetSelectionAnchor(touchdownPoint / fontSize);
+            // stop tracking the touchdown point
+            _singleClickTouchdownPos = std::nullopt;
+        }
+    }
 
-    this->_terminal->SetSelectionEnd(cursorPosition);
+    this->_terminal->SetSelectionEnd(cursorPosition / fontSize);
     this->_renderer->TriggerSelection();
 
     return S_OK;
 }
 CATCH_RETURN();
 
+void HwndTerminal::_ClearSelection() noexcept
+try
+{
+    auto lock{ _terminal->LockForWriting() };
+    _terminal->ClearSelection();
+    _renderer->TriggerSelection();
+}
+CATCH_LOG();
+
 void _stdcall TerminalClearSelection(void* terminal)
 {
-    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
-    publicTerminal->_terminal->ClearSelection();
+    auto publicTerminal = static_cast<HwndTerminal*>(terminal);
+    publicTerminal->_ClearSelection();
 }
+
 bool _stdcall TerminalIsSelectionActive(void* terminal)
 {
     const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
@@ -410,9 +631,10 @@ bool _stdcall TerminalIsSelectionActive(void* terminal)
 // Returns the selected text in the terminal.
 const wchar_t* _stdcall TerminalGetSelection(void* terminal)
 {
-    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
+    auto publicTerminal = static_cast<HwndTerminal*>(terminal);
 
     const auto bufferData = publicTerminal->_terminal->RetrieveSelectedTextFromBuffer(false);
+    publicTerminal->_ClearSelection();
 
     // convert text: vector<string> --> string
     std::wstring selectedText;
@@ -422,15 +644,11 @@ const wchar_t* _stdcall TerminalGetSelection(void* terminal)
     }
 
     auto returnText = wil::make_cotaskmem_string_nothrow(selectedText.c_str());
-    TerminalClearSelection(terminal);
-
     return returnText.release();
 }
 
-void _stdcall TerminalSendKeyEvent(void* terminal, WPARAM wParam)
+static ControlKeyStates getControlKeyState() noexcept
 {
-    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
-    const auto scanCode = MapVirtualKeyW((UINT)wParam, MAPVK_VK_TO_VSC);
     struct KeyModifier
     {
         int vkey;
@@ -458,18 +676,101 @@ void _stdcall TerminalSendKeyEvent(void* terminal, WPARAM wParam)
         }
     }
 
-    publicTerminal->_terminal->SendKeyEvent((WORD)wParam, (WORD)scanCode, flags);
+    return flags;
 }
 
-void _stdcall TerminalSendCharEvent(void* terminal, wchar_t ch)
+bool HwndTerminal::_CanSendVTMouseInput() const noexcept
 {
-    if (ch == '\t')
+    // Only allow the transit of mouse events if shift isn't pressed.
+    const bool shiftPressed = GetKeyState(VK_SHIFT) < 0;
+    return !shiftPressed && _focused && _terminal->IsTrackingMouseInput();
+}
+
+bool HwndTerminal::_SendMouseEvent(UINT uMsg, WPARAM wParam, LPARAM lParam) noexcept
+try
+{
+    til::point cursorPosition{
+        GET_X_LPARAM(lParam),
+        GET_Y_LPARAM(lParam),
+    };
+
+    const til::size fontSize{ this->_actualFont.GetSize() };
+    short wheelDelta{ 0 };
+    if (uMsg == WM_MOUSEWHEEL || uMsg == WM_MOUSEHWHEEL)
     {
+        wheelDelta = HIWORD(wParam);
+
+        // If it's a *WHEEL event, it's in screen coordinates, not window (?!)
+        POINT coordsToTransform = cursorPosition;
+        ScreenToClient(_hwnd.get(), &coordsToTransform);
+        cursorPosition = coordsToTransform;
+    }
+
+    const TerminalInput::MouseButtonState state{
+        WI_IsFlagSet(GetKeyState(VK_LBUTTON), KeyPressed),
+        WI_IsFlagSet(GetKeyState(VK_MBUTTON), KeyPressed),
+        WI_IsFlagSet(GetKeyState(VK_RBUTTON), KeyPressed)
+    };
+
+    return _terminal->SendMouseEvent(cursorPosition / fontSize, uMsg, getControlKeyState(), wheelDelta, state);
+}
+catch (...)
+{
+    LOG_CAUGHT_EXCEPTION();
+    return false;
+}
+
+void HwndTerminal::_SendKeyEvent(WORD vkey, WORD scanCode, WORD flags, bool keyDown) noexcept
+try
+{
+    auto modifiers = getControlKeyState();
+    if (WI_IsFlagSet(flags, ENHANCED_KEY))
+    {
+        modifiers |= ControlKeyStates::EnhancedKey;
+    }
+    _terminal->SendKeyEvent(vkey, scanCode, modifiers, keyDown);
+}
+CATCH_LOG();
+
+void HwndTerminal::_SendCharEvent(wchar_t ch, WORD scanCode, WORD flags) noexcept
+try
+{
+    if (_terminal->IsSelectionActive())
+    {
+        _ClearSelection();
+        if (ch == UNICODE_ESC)
+        {
+            // ESC should clear any selection before it triggers input.
+            // Other characters pass through.
+            return;
+        }
+    }
+
+    if (ch == UNICODE_TAB)
+    {
+        // TAB was handled as a keydown event (cf. Terminal::SendKeyEvent)
         return;
     }
 
-    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
-    publicTerminal->_terminal->SendCharEvent(ch);
+    auto modifiers = getControlKeyState();
+    if (WI_IsFlagSet(flags, ENHANCED_KEY))
+    {
+        modifiers |= ControlKeyStates::EnhancedKey;
+    }
+    _terminal->SendCharEvent(ch, scanCode, modifiers);
+}
+CATCH_LOG();
+
+void _stdcall TerminalSendKeyEvent(void* terminal, WORD vkey, WORD scanCode, WORD flags, bool keyDown)
+{
+    const auto publicTerminal = static_cast<HwndTerminal*>(terminal);
+    publicTerminal->_SendKeyEvent(vkey, scanCode, flags, keyDown);
+}
+
+void _stdcall TerminalSendCharEvent(void* terminal, wchar_t ch, WORD scanCode, WORD flags)
+{
+    const auto publicTerminal = static_cast<HwndTerminal*>(terminal);
+    publicTerminal->_SendCharEvent(ch, scanCode, flags);
 }
 
 void _stdcall DestroyTerminal(void* terminal)
@@ -487,6 +788,7 @@ void _stdcall TerminalSetTheme(void* terminal, TerminalTheme theme, LPCWSTR font
 
         publicTerminal->_terminal->SetDefaultForeground(theme.DefaultForeground);
         publicTerminal->_terminal->SetDefaultBackground(theme.DefaultBackground);
+        publicTerminal->_renderEngine->SetSelectionBackground(theme.DefaultSelectionBackground, theme.SelectionBackgroundAlpha);
 
         // Set the font colors
         for (size_t tableIndex = 0; tableIndex < 16; tableIndex++)
@@ -498,7 +800,7 @@ void _stdcall TerminalSetTheme(void* terminal, TerminalTheme theme, LPCWSTR font
 
     publicTerminal->_terminal->SetCursorStyle(theme.CursorStyle);
 
-    publicTerminal->_desiredFont = { fontFamily, 0, 10, { 0, fontSize }, CP_UTF8 };
+    publicTerminal->_desiredFont = { fontFamily, 0, DEFAULT_FONT_WEIGHT, { 0, fontSize }, CP_UTF8 };
     publicTerminal->_UpdateFont(newDpi);
 
     // When the font changes the terminal dimensions need to be recalculated since the available row and column
@@ -509,14 +811,6 @@ void _stdcall TerminalSetTheme(void* terminal, TerminalTheme theme, LPCWSTR font
     COORD dimensions = {};
     const SIZE windowSize{ windowRect.right - windowRect.left, windowRect.bottom - windowRect.top };
     publicTerminal->Refresh(windowSize, &dimensions);
-}
-
-// Resizes the terminal to the specified rows and columns.
-HRESULT _stdcall TerminalResize(void* terminal, COORD dimensions)
-{
-    const auto publicTerminal = static_cast<const HwndTerminal*>(terminal);
-
-    return publicTerminal->_terminal->UserResize(dimensions);
 }
 
 void _stdcall TerminalBlinkCursor(void* terminal)
@@ -536,12 +830,25 @@ void _stdcall TerminalSetCursorVisible(void* terminal, const bool visible)
     publicTerminal->_terminal->SetCursorOn(visible);
 }
 
+void __stdcall TerminalSetFocus(void* terminal)
+{
+    auto publicTerminal = static_cast<HwndTerminal*>(terminal);
+    publicTerminal->_focused = true;
+}
+
+void __stdcall TerminalKillFocus(void* terminal)
+{
+    auto publicTerminal = static_cast<HwndTerminal*>(terminal);
+    publicTerminal->_focused = false;
+}
+
 // Routine Description:
 // - Copies the text given onto the global system clipboard.
 // Arguments:
 // - rows - Rows of text data to copy
 // - fAlsoCopyFormatting - true if the color and formatting should also be copied, false otherwise
 HRESULT HwndTerminal::_CopyTextToSystemClipboard(const TextBuffer::TextAndColor& rows, bool const fAlsoCopyFormatting)
+try
 {
     std::wstring finalString;
 
@@ -570,7 +877,7 @@ HRESULT HwndTerminal::_CopyTextToSystemClipboard(const TextBuffer::TextAndColor&
     RETURN_LAST_ERROR_IF(!OpenClipboard(_hwnd.get()));
 
     { // Clipboard Scope
-        auto clipboardCloser = wil::scope_exit([]() noexcept {
+        auto clipboardCloser = wil::scope_exit([]() {
             LOG_LAST_ERROR_IF(!CloseClipboard());
         });
 
@@ -580,10 +887,10 @@ HRESULT HwndTerminal::_CopyTextToSystemClipboard(const TextBuffer::TextAndColor&
         if (fAlsoCopyFormatting)
         {
             const auto& fontData = _actualFont;
-            int const iFontHeightPoints = fontData.GetUnscaledSize().Y * 72 / this->_currentDpi;
-            const COLORREF bgColor = _terminal->GetBackgroundColor(_terminal->GetDefaultBrushColors());
+            int const iFontHeightPoints = fontData.GetUnscaledSize().Y; // this renderer uses points already
+            const COLORREF bgColor = _terminal->GetAttributeColors(_terminal->GetDefaultBrushColors()).second;
 
-            std::string HTMLToPlaceOnClip = TextBuffer::GenHTML(rows, iFontHeightPoints, fontData.GetFaceName(), bgColor, "Hwnd Console Host");
+            std::string HTMLToPlaceOnClip = TextBuffer::GenHTML(rows, iFontHeightPoints, fontData.GetFaceName(), bgColor);
             _CopyToSystemClipboard(HTMLToPlaceOnClip, L"HTML Format");
 
             std::string RTFToPlaceOnClip = TextBuffer::GenRTF(rows, iFontHeightPoints, fontData.GetFaceName(), bgColor);
@@ -598,6 +905,7 @@ HRESULT HwndTerminal::_CopyTextToSystemClipboard(const TextBuffer::TextAndColor&
 
     return S_OK;
 }
+CATCH_RETURN()
 
 // Routine Description:
 // - Copies the given string onto the global system clipboard in the specified format

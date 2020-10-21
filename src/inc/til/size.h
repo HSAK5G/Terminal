@@ -25,6 +25,14 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             size(static_cast<ptrdiff_t>(width), static_cast<ptrdiff_t>(height))
         {
         }
+        constexpr size(ptrdiff_t width, int height) noexcept :
+            size(width, static_cast<ptrdiff_t>(height))
+        {
+        }
+        constexpr size(int width, ptrdiff_t height) noexcept :
+            size(static_cast<ptrdiff_t>(width), height)
+        {
+        }
 #endif
 
         size(size_t width, size_t height)
@@ -53,6 +61,42 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         {
         }
 
+        // This template will convert to size from anything that has a X and a Y field that are floating-point;
+        // a math type is required. If you _don't_ provide one, you're going to
+        // get a compile-time error about "cannot convert from initializer-list to til::size"
+        template<typename TilMath, typename TOther>
+        constexpr size(TilMath, const TOther& other, std::enable_if_t<std::is_floating_point_v<decltype(std::declval<TOther>().X)> && std::is_floating_point_v<decltype(std::declval<TOther>().Y)>, int> /*sentinel*/ = 0) :
+            size(TilMath::template cast<ptrdiff_t>(other.X), TilMath::template cast<ptrdiff_t>(other.Y))
+        {
+        }
+
+        // This template will convert to size from anything that has a cx and a cy field that are floating-point;
+        // a math type is required. If you _don't_ provide one, you're going to
+        // get a compile-time error about "cannot convert from initializer-list to til::size"
+        template<typename TilMath, typename TOther>
+        constexpr size(TilMath, const TOther& other, std::enable_if_t<std::is_floating_point_v<decltype(std::declval<TOther>().cx)> && std::is_floating_point_v<decltype(std::declval<TOther>().cy)>, int> /*sentinel*/ = 0) :
+            size(TilMath::template cast<ptrdiff_t>(other.cx), TilMath::template cast<ptrdiff_t>(other.cy))
+        {
+        }
+
+        // This template will convert to size from anything that has a Width and a Height field that are floating-point;
+        // a math type is required. If you _don't_ provide one, you're going to
+        // get a compile-time error about "cannot convert from initializer-list to til::size"
+        template<typename TilMath, typename TOther>
+        constexpr size(TilMath, const TOther& other, std::enable_if_t<std::is_floating_point_v<decltype(std::declval<TOther>().Width)> && std::is_floating_point_v<decltype(std::declval<TOther>().Height)>, int> /*sentinel*/ = 0) :
+            size(TilMath::template cast<ptrdiff_t>(other.Width), TilMath::template cast<ptrdiff_t>(other.Height))
+        {
+        }
+
+        // This template will convert to size from floating-point args;
+        // a math type is required. If you _don't_ provide one, you're going to
+        // get a compile-time error about "cannot convert from initializer-list to til::size"
+        template<typename TilMath, typename TOther>
+        constexpr size(TilMath, const TOther& width, const TOther& height, std::enable_if_t<std::is_floating_point_v<TOther>, int> /*sentinel*/ = 0) :
+            size(TilMath::template cast<ptrdiff_t>(width), TilMath::template cast<ptrdiff_t>(height))
+        {
+        }
+
         constexpr bool operator==(const size& other) const noexcept
         {
             return _width == other._width &&
@@ -62,6 +106,11 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         constexpr bool operator!=(const size& other) const noexcept
         {
             return !(*this == other);
+        }
+
+        constexpr explicit operator bool() const noexcept
+        {
+            return _width > 0 && _height > 0;
         }
 
         size operator+(const size& other) const
@@ -95,6 +144,19 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             THROW_HR_IF(E_ABORT, !base::CheckMul(_height, other._height).AssignIfValid(&height));
 
             return size{ width, height };
+        }
+
+        template<typename TilMath>
+        size scale(TilMath, const float scale) const
+        {
+            struct
+            {
+                float Width, Height;
+            } sz;
+            THROW_HR_IF(E_ABORT, !base::CheckMul(scale, _width).AssignIfValid(&sz.Width));
+            THROW_HR_IF(E_ABORT, !base::CheckMul(scale, _height).AssignIfValid(&sz.Height));
+
+            return til::size(TilMath(), sz);
         }
 
         size operator/(const size& other) const
@@ -188,6 +250,14 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return result;
         }
 
+        template<typename T>
+        T area() const
+        {
+            T ret;
+            THROW_HR_IF(E_ABORT, !base::CheckMul(_width, _height).AssignIfValid(&ret));
+            return ret;
+        }
+
 #ifdef _WINCONTYPES_
         operator COORD() const
         {
@@ -215,6 +285,11 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
 #endif
 
+        std::wstring to_string() const
+        {
+            return wil::str_printf<std::wstring>(L"[W:%td, H:%td]", width(), height());
+        }
+
     protected:
         ptrdiff_t _width;
         ptrdiff_t _height;
@@ -234,7 +309,7 @@ namespace WEX::TestExecution
     public:
         static WEX::Common::NoThrowString ToString(const ::til::size& size)
         {
-            return WEX::Common::NoThrowString().Format(L"[W:%td, H:%td]", size.width(), size.height());
+            return WEX::Common::NoThrowString(size.to_string().c_str());
         }
     };
 

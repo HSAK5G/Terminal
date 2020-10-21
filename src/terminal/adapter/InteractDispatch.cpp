@@ -37,17 +37,17 @@ bool InteractDispatch::WriteInput(std::deque<std::unique_ptr<IInputEvent>>& inpu
 }
 
 // Method Description:
-// - Writes a Ctrl-C event to the host. The host will then decide what to do
-//      with it, including potentially sending an interrupt to a client
-//      application.
+// - Writes a key event to the host in a fashion that will enable the host to
+//   process special keys such as Ctrl-C or Ctrl+Break. The host will then
+//   decide what to do with it, including potentially sending an interrupt to a
+//   client application.
 // Arguments:
-// <none>
+// - event: The key to send to the host.
 // Return Value:
 // True if handled successfully. False otherwise.
-bool InteractDispatch::WriteCtrlC()
+bool InteractDispatch::WriteCtrlKey(const KeyEvent& event)
 {
-    KeyEvent key = KeyEvent(true, 1, 'C', 0, UNICODE_ETX, LEFT_CTRL_PRESSED);
-    return _pConApi->PrivateWriteConsoleControlInput(key);
+    return _pConApi->PrivateWriteConsoleControlInput(event);
 }
 
 // Method Description:
@@ -92,11 +92,13 @@ bool InteractDispatch::WriteString(const std::wstring_view string)
 //      codes that are supported in one direction but not the other.
 //Arguments:
 // - function - An identifier of the WindowManipulation function to perform
-// - parameters - Additional parameters to pass to the function
+// - parameter1 - The first optional parameter for the function
+// - parameter2 - The second optional parameter for the function
 // Return value:
 // True if handled successfully. False otherwise.
 bool InteractDispatch::WindowManipulation(const DispatchTypes::WindowManipulationType function,
-                                          const std::basic_string_view<size_t> parameters)
+                                          const VTParameter parameter1,
+                                          const VTParameter parameter2)
 {
     bool success = false;
     // Other Window Manipulation functions:
@@ -105,21 +107,15 @@ bool InteractDispatch::WindowManipulation(const DispatchTypes::WindowManipulatio
     switch (function)
     {
     case DispatchTypes::WindowManipulationType::RefreshWindow:
-        if (parameters.empty())
-        {
-            success = DispatchCommon::s_RefreshWindow(*_pConApi);
-        }
+        success = DispatchCommon::s_RefreshWindow(*_pConApi);
         break;
     case DispatchTypes::WindowManipulationType::ResizeWindowInCharacters:
         // TODO:GH#1765 We should introduce a better `ResizeConpty` function to
         // the ConGetSet interface, that specifically handles a conpty resize.
-        if (parameters.size() == 2)
+        success = DispatchCommon::s_ResizeWindow(*_pConApi, parameter2.value_or(0), parameter1.value_or(0));
+        if (success)
         {
-            success = DispatchCommon::s_ResizeWindow(*_pConApi, til::at(parameters, 1), til::at(parameters, 0));
-            if (success)
-            {
-                DispatchCommon::s_SuppressResizeRepaint(*_pConApi);
-            }
+            DispatchCommon::s_SuppressResizeRepaint(*_pConApi);
         }
         break;
     default:

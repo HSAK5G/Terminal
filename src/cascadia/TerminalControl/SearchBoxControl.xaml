@@ -142,7 +142,6 @@
                 <ResourceDictionary x:Key="HighContrast">
                     <Style x:Key="FontIconStyle" TargetType="FontIcon">
                         <Setter Property="FontSize" Value="12" />
-                        <Setter Property="Foreground" Value="{ThemeResource SystemColorWindowTextColor}" />
                     </Style>
                     <Style x:Key="SearchBoxBackground" TargetType="StackPanel">
                         <Setter Property="Background" Value="{ThemeResource SystemColorWindowColor}" />
